@@ -42,11 +42,16 @@ struct SerialMM {
 
     uint8_t regshift;
     uint8_t endianness;
+    bool tangox_layout;
 };
 
 SerialMM *serial_mm_init(MemoryRegion *address_space,
                          hwaddr base, int regshift,
                          qemu_irq irq, int baudbase,
                          Chardev *chr, enum device_endian end);
+
+SerialMM *serial_mm_tangox_init(MemoryRegion *address_space,
+                                hwaddr base, qemu_irq irq, int baudbase,
+                                Chardev *chr, enum device_endian end);
 
 #endif

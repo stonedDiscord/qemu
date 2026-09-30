@@ -33,15 +33,46 @@
 static uint64_t serial_mm_read(void *opaque, hwaddr addr, unsigned size)
 {
     SerialMM *s = SERIAL_MM(opaque);
-    return serial_io_ops.read(&s->serial, addr >> s->regshift, 1);
+    unsigned reg = addr >> s->regshift;
+
+    if (s->tangox_layout) {
+        switch (reg & 7) {
+        case 5:
+            reg = 3;
+            break;
+        case 6:
+            reg = 4;
+            break;
+        case 7:
+            reg = 5;
+            break;
+        default:
+            break;
+        }
+    }
+    return serial_io_ops.read(&s->serial, reg, 1);
 }
 
 static void serial_mm_write(void *opaque, hwaddr addr,
                             uint64_t value, unsigned size)
 {
     SerialMM *s = SERIAL_MM(opaque);
+    unsigned reg = addr >> s->regshift;
+
+    if (s->tangox_layout) {
+        switch (reg & 7) {
+        case 1: reg = 0; break;
+        case 2: reg = 1; break;
+        case 3: reg = 2; break;
+        case 4: reg = 2; break;
+        case 5: reg = 3; break;
+        case 6: reg = 4; break;
+        case 7: reg = 5; break;
+        default: break;
+        }
+    }
     value &= 255;
-    serial_io_ops.write(&s->serial, addr >> s->regshift, value, 1);
+    serial_io_ops.write(&s->serial, reg, value, 1);
 }
 
 static const MemoryRegionOps serial_mm_ops[] = {
@@ -89,7 +120,8 @@ static const VMStateDescription vmstate_serial_mm = {
     .version_id = 3,
     .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
-        VMSTATE_STRUCT(serial, SerialMM, 0, vmstate_serial, SerialState),
+    VMSTATE_STRUCT(serial, SerialMM, 0, vmstate_serial, SerialState),
+        VMSTATE_BOOL(tangox_layout, SerialMM),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -113,6 +145,26 @@ SerialMM *serial_mm_init(MemoryRegion *address_space,
     mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(smm), 0);
     memory_region_add_subregion(address_space, base, mr);
 
+    return smm;
+}
+
+SerialMM *serial_mm_tangox_init(MemoryRegion *address_space,
+                                hwaddr base, qemu_irq irq, int baudbase,
+                                Chardev *chr, enum device_endian end)
+{
+    SerialMM *smm = SERIAL_MM(qdev_new(TYPE_SERIAL_MM));
+    MemoryRegion *mr;
+
+    qdev_prop_set_uint8(DEVICE(smm), "regshift", 2);
+    qdev_prop_set_uint32(DEVICE(smm), "baudbase", baudbase);
+    qdev_prop_set_chr(DEVICE(smm), "chardev", chr);
+    qdev_set_legacy_instance_id(DEVICE(smm), base, 2);
+    qdev_prop_set_uint8(DEVICE(smm), "endianness", end);
+    smm->tangox_layout = true;
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(smm), &error_fatal);
+    sysbus_connect_irq(SYS_BUS_DEVICE(smm), 0, irq);
+    mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(smm), 0);
+    memory_region_add_subregion(address_space, base, mr);
     return smm;
 }
 
