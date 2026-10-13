@@ -163,8 +163,8 @@ const mips_def_t mips_defs[] =
         .CP0_Config0 = MIPS_CONFIG0 | (0x1 << CP0C0_AR) |
                     (MMU_TYPE_R4000 << CP0C0_MT),
         .CP0_Config1 = MIPS_CONFIG1 | (15 << CP0C1_MMU) |
-                       (3 << CP0C1_IS) | (1 << CP0C1_IL) | (1 << CP0C1_IA) |
-                       (3 << CP0C1_DS) | (1 << CP0C1_DL) | (1 << CP0C1_DA) |
+                       (3 << CP0C1_IS) | (3 << CP0C1_IL) | (1 << CP0C1_IA) |
+                       (3 << CP0C1_DS) | (3 << CP0C1_DL) | (1 << CP0C1_DA) |
                        (0 << CP0C1_CA),
         .CP0_Config2 = MIPS_CONFIG2,
         .CP0_Config3 = MIPS_CONFIG3,

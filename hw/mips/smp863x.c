@@ -580,6 +580,24 @@ static const MemoryRegionOps smp863x_cpuregs_ops = {
     .valid = { .min_access_size = 1, .max_access_size = 4 },
 };
 
+static uint64_t smp863x_irqhandler_read(void *opaque, hwaddr addr, unsigned size)
+{
+    return smp863x_regs_read(opaque, addr + 0xe0000, size);
+}
+
+static void smp863x_irqhandler_write(void *opaque, hwaddr addr, uint64_t data,
+                                   unsigned size)
+{
+    smp863x_regs_write(opaque, addr + 0xe0000, data, size);
+}
+
+static const MemoryRegionOps smp863x_irqhandler_ops = {
+    .read = smp863x_irqhandler_read,
+    .write = smp863x_irqhandler_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+};
+
 static void smp863x_cpu_reset(void *opaque)
 {
     SMP863XState *s = opaque;
@@ -933,6 +951,13 @@ static void smp863x_init_common(MachineState *machine, bool front_panel_uart)
     }
     memory_region_add_subregion(sysmem, 0x10000, regs);
     memory_region_add_subregion(sysmem, SMP863X_REG_BASE, cpuregs);
+    {
+        MemoryRegion *irqhandler = g_new(MemoryRegion, 1);
+
+        memory_region_init_io(irqhandler, NULL, &smp863x_irqhandler_ops, s,
+                              "smp863x-irq-handler-registers", 0x10000);
+        memory_region_add_subregion(sysmem, 0xe0000, irqhandler);
+    }
 
     /* TangoX exposes a standard OHCI 1.1 register block at host-interface
      * offset 0x1500.  The kernel's tangox-ohci driver probes this block
