@@ -91,3 +91,4 @@ config SMP863X
     bool
     default y
     select BITBANG_I2C
+    select AT24C
