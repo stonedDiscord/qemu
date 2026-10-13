@@ -13,6 +13,7 @@
 #include "hw/usb/hcd-ohci.h"
 #include "hw/usb/hcd-ehci.h"
 #include "hw/block/flash.h"
+#include "hw/nvram/eeprom_at24c.h"
 #include "hw/ide/mmio.h"
 #include "hw/ide/pci.h"
 #include "hw/ide/sii3114.h"
@@ -21,6 +22,8 @@
 #include "hw/core/irq.h"
 #include "hw/core/loader.h"
 #include "hw/core/qdev.h"
+#include "hw/core/qdev-properties.h"
+#include "hw/core/qdev-properties-system.h"
 #include "hw/pci/pci.h"
 #include "hw/pci/pci_host.h"
 #include "hw/mips/mips.h"
@@ -375,9 +378,17 @@ static uint64_t smp863x_remap_read(void *opaque, hwaddr addr, unsigned size)
     SMP863XState *s = window->s;
     uint64_t value = 0;
 
-    /* Any non-zero remap source in this machine selects the parallel NOR.
-     * The source address is 64 MiB aligned; the window offset selects the
-     * byte within that source. */
+    if (s->remap[window->index] >= SMP863X_DRAM_BASE &&
+        (uint64_t)s->remap[window->index] + addr + size <=
+            SMP863X_DRAM_BASE + memory_region_size(s->ram)) {
+        uint8_t bytes[8] = { 0 };
+        address_space_read(&address_space_memory,
+                           s->remap[window->index] + addr,
+                           MEMTXATTRS_UNSPECIFIED, bytes, size);
+        return ldq_le_p(bytes);
+    }
+
+    /* Boot reads use the image snapshot, independent of CFI query mode. */
     if (!s->flash_data || s->remap[window->index] == 0 ||
         addr + size > s->flash_data_size || size > sizeof(value)) {
         return UINT64_MAX;
@@ -389,8 +400,13 @@ static uint64_t smp863x_remap_read(void *opaque, hwaddr addr, unsigned size)
 static void smp863x_remap_write(void *opaque, hwaddr addr, uint64_t data,
                                 unsigned size)
 {
-    /* NOR writes are intentionally left to the CFI device at its native
-     * address.  Boot ROM and zboot only read through remap windows. */
+    SMP863XRemapWindow *window = opaque;
+    SMP863XState *s = window->s;
+
+    if (s->remap[window->index] && addr + size <= SMP863X_PFLASH_SIZE) {
+        memory_region_dispatch_write(s->flash, addr, data, size_memop(size),
+                                     MEMTXATTRS_UNSPECIFIED);
+    }
 }
 
 static const MemoryRegionOps smp863x_remap_ops = {
@@ -636,6 +652,24 @@ static void smp863x_xrpc(SMP863XState *s)
         id = ldl_le_p(header + 4);
         if (length >= 32 && (uint64_t)request + length <= ram_end) {
             result = RM_NOTIMPLEMENTED;
+            /* Clear CT1 CPU code: transport the task to param1.  Zboot
+             * parses and decompresses its ZBF header in guest code. */
+            if (id == 5 && header[34] == 1 && header[35] == 0xff) {
+                uint32_t count = ldl_le_p(header + 8);
+                uint32_t dest = ldl_le_p(header + 12);
+                if (count && length >= 32 + count &&
+                    length - count == 0x324 &&
+                    dest >= SMP863X_DRAM_BASE &&
+                    (uint64_t)dest + count <= ram_end) {
+                    uint8_t *ram = memory_region_get_ram_ptr(s->ram);
+                    memmove(ram + dest - SMP863X_DRAM_BASE,
+                            ram + request + length - count - SMP863X_DRAM_BASE,
+                            count);
+                    result = RM_OK;
+                } else {
+                    result = RM_INVALID_PARAMETER;
+                }
+            }
             /* XLOAD certificate type 6 installs the IRQ handler. Its
              * encrypted payload is represented by host-side behavior,
              * rather than decoded or executed by an auxiliary CPU. */
@@ -785,7 +819,7 @@ static void smp863x_regs_write(void *opaque, hwaddr addr, uint64_t data,
         smp863x_update_irq(s);
         return;
     case CPU_REMAP:
-        s->remap[0] = value & 0xfc000000U;
+        s->remap[0] = value & 0xffff0000U;
         return;
     case CPU_REMAP1:
         s->remap[1] = value & 0xfc000000U;
@@ -911,76 +945,55 @@ static void smp863x_cpu_reset(void *opaque)
 
 }
 
-static bool smp863x_find_romfs(const uint8_t *flash, size_t size,
-                               size_t start, size_t *romfs)
+/* XOS hands the main CPU the clear CT0 task selected by XENV x.boot.
+ * Authentication and XPU execution are not emulated here. */
+static bool smp863x_load_zboot(SMP863XState *s, const uint8_t *flash,
+                               size_t flash_size)
 {
-    size_t off;
+    uint32_t env_size, boot = UINT32_MAX, length, task_size, load;
+    size_t pos, payload;
 
-    for (off = start; off + 8 <= size; off += 0x1000) {
-        if (!memcmp(flash + off, "-rom1fs-", 8)) {
-            *romfs = off;
-            return true;
+    if (flash_size < 24) {
+        return false;
+    }
+    env_size = ldl_le_p(flash);
+    if (env_size < 24 || env_size > flash_size) {
+        return false;
+    }
+    for (pos = 24; pos + 2 <= env_size;) {
+        size_t len = ((flash[pos] & 15) << 8) | flash[pos + 1];
+        if (len < 3 || len > env_size - pos) {
+            return false;
         }
+        if (len == 13 && !memcmp(flash + pos + 2, "x.boot", 7)) {
+            boot = ldl_le_p(flash + pos + 9);
+            break;
+        }
+        pos += len;
     }
-    return false;
-}
-
-static bool smp863x_load_zbf(SMP863XState *s, const uint8_t *flash,
-                              size_t flash_size, size_t search_start)
-{
-    size_t romfs, file, name_end, data, zbf, compressed_size;
-    uint32_t next, payload_size, load_addr, start_addr;
-    uint8_t *image;
-    ssize_t image_size;
-
-    if (!smp863x_find_romfs(flash, flash_size, search_start, &romfs)) {
+    if (boot >= 0x48000000U && boot < 0x48000000U + flash_size) {
+        boot -= 0x48000000U;
+    }
+    if (boot > flash_size || flash_size - boot < 36) {
         return false;
     }
-    /* ROMFS records are aligned and the XRPC file follows . and ... */
-    file = romfs + 0x60;
-    next = ldl_be_p(flash + file);
-    name_end = file + 16;
-    while (name_end < flash_size && flash[name_end]) {
-        name_end++;
-    }
-    data = (name_end + 1 + 15) & ~15ULL;
-    if (data >= flash_size || next == 0) {
-        return false;
-    }
-    payload_size = ldl_be_p(flash + file + 8);
-    if (data + payload_size > flash_size || payload_size < 0x360) {
-        return false;
-    }
-    /* Find the embedded ZBF header after the XRPC clear headers. */
-    zbf = data + 0x20;
-    while (zbf + 32 < data + payload_size &&
-           memcmp(flash + zbf, "FNIB", 4)) {
-        zbf += 4;
-    }
-    if (ldl_le_p(flash + zbf) != 0x42494e46 ||
-        !(ldl_le_p(flash + zbf + 4) & 0x10)) {
-        return false;
-    }
-    load_addr = ldl_le_p(flash + zbf + 8);
-    start_addr = ldl_le_p(flash + zbf + 12);
-    compressed_size = ldl_le_p(flash + zbf + 24);
-    if (compressed_size < 32 || zbf + 32 + compressed_size > flash_size) {
-        return false;
-    }
-    image = g_malloc(8 * MiB);
-    image_size = gunzip(image, 8 * MiB,
-                        (uint8_t *)flash + zbf + 32, compressed_size);
-    if (image_size < 0 || (load_addr & 0x1fffffff) < SMP863X_DRAM_BASE ||
-        (load_addr & 0x1fffffff) + image_size >
+    task_size = ldl_le_p(flash + boot + 8);
+    load = ldl_le_p(flash + boot + 12);
+    length = ldl_le_p(flash + boot + 28);
+    if (ldl_le_p(flash + boot + 4) != 5 || flash[boot + 35] != 0xff ||
+        flash[boot + 34] != 0 || length > flash_size - boot ||
+        length < 32 || task_size > length - 32 || !task_size ||
+        load < SMP863X_DRAM_BASE ||
+        (uint64_t)load + task_size >
             SMP863X_DRAM_BASE + memory_region_size(s->ram)) {
-        g_free(image);
         return false;
     }
-    memcpy(memory_region_get_ram_ptr(s->ram) +
-           ((load_addr & 0x1fffffff) - SMP863X_DRAM_BASE), image,
-           image_size);
-    g_free(image);
-    s->reset_pc = start_addr;
+    payload = boot + length - task_size;
+    memcpy(memory_region_get_ram_ptr(s->ram) + load - SMP863X_DRAM_BASE,
+           flash + payload, task_size);
+    s->remap[0] = load;
+    /* XOS remaps the physical reset window to the loaded CT0 task. */
+    s->reset_pc = 0xbfc00000U;
     return true;
 }
 
@@ -1016,6 +1029,18 @@ static void smp863x_init_common(MachineState *machine, bool front_panel_uart)
         s->rtc_i2c.current_addr = -1;
         s->rtc_sda = 1;
         i2c_slave_create_simple(bus, TYPE_XG1000_RTC, 0x51);
+        /* A0/A1/A2 are low: AT24C02 uses 7-bit address 0x50. */
+        if (blk_by_name("xgeeprom")) {
+            I2CSlave *eeprom = i2c_slave_new("at24c-eeprom", 0x50);
+            qdev_prop_set_uint32(DEVICE(eeprom), "rom-size", 256);
+            qdev_prop_set_drive(DEVICE(eeprom), "drive",
+                                blk_by_name("xgeeprom"));
+            i2c_slave_realize_and_unref(eeprom, bus, &error_fatal);
+        } else {
+            uint8_t *erased = g_malloc(256);
+            memset(erased, 0xff, 256);
+            at24c_eeprom_init_rom(bus, 0x50, 256, erased, 256);
+        }
     }
 
     cpuclk = clock_new(OBJECT(machine), "cpu-refclk");
@@ -1076,7 +1101,7 @@ static void smp863x_init_common(MachineState *machine, bool front_panel_uart)
         flash_data = g_malloc(SMP863X_PFLASH_SIZE);
         if (blk_pread(blk_by_legacy_dinfo(dinfo), 0, SMP863X_PFLASH_SIZE,
                       flash_data, 0) < 0 ||
-            !smp863x_load_zbf(s, flash_data, SMP863X_PFLASH_SIZE, 0x40000)) {
+            !smp863x_load_zboot(s, flash_data, SMP863X_PFLASH_SIZE)) {
             error_report("invalid SMP863x parallel flash boot image");
             g_free(flash_data);
             exit(EXIT_FAILURE);
@@ -1100,7 +1125,9 @@ static void smp863x_init_common(MachineState *machine, bool front_panel_uart)
         memcpy(memory_region_get_ram_ptr(s->flash), flash_data,
                SMP863X_PFLASH_SIZE);
     }
-    s->remap[0] = SMP863X_PFLASH_BASE;
+    if (!s->flash_boot) {
+        s->remap[0] = SMP863X_PFLASH_BASE;
+    }
     s->remap[4] = 0x48000000U;
     /* Remap windows expose the same parallel NOR contents at the GBUS
      * addresses used by XOS and zboot. */
@@ -1171,12 +1198,12 @@ static void smp863x_init_common(MachineState *machine, bool front_panel_uart)
     if (s->flash_boot) {
         MemoryRegion *boot_alias = g_new(MemoryRegion, 1);
         memory_region_init_alias(boot_alias, NULL, "smp863x-remapped-boot",
-                                 machine->ram, 0x01200000, 8 * MiB);
+                                 machine->ram, s->remap[0] - SMP863X_DRAM_BASE, 64 * KiB);
         memory_region_add_subregion_overlap(sysmem, 0xbfc00000ULL,
                                             boot_alias, 2);
         boot_alias = g_new(MemoryRegion, 1);
         memory_region_init_alias(boot_alias, NULL, "smp863x-remapped-boot-phys",
-                                 machine->ram, 0x01200000, 8 * MiB);
+                                 machine->ram, s->remap[0] - SMP863X_DRAM_BASE, 64 * KiB);
         memory_region_add_subregion_overlap(sysmem, SMP863X_PFLASH_BASE,
                                             boot_alias, 2);
     }
