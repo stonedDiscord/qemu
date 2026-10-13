@@ -5,6 +5,7 @@
 #include "qemu/timer.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
+#include "qemu/log.h"
 #include "hw/char/serial-mm.h"
 #include "hw/usb/hcd-ohci.h"
 #include "hw/usb/hcd-ehci.h"
@@ -21,6 +22,7 @@
 #include "hw/pci/pci_host.h"
 #include "hw/mips/mips.h"
 #include "system/memory.h"
+#include "system/address-spaces.h"
 #include "system/reset.h"
 #include "system/system.h"
 #include "system/blockdev.h"
@@ -65,6 +67,13 @@
 #define LR_ETH_MAC_LO           0x61ce0
 #define LR_ETH_MAC_HI           0x61ce4
 #define LR_XENV_LOCATION        0x61ff0
+#define LR_XPU_STAGE            0x61ffc
+#define XPU_IRQ_SOFTSET         0xee010
+#define SOFT_IRQ_XRPC           (1U << 4)
+#define SOFT_IRQ_IH_UNINSTALL   (1U << 9)
+#define RM_OK                  6
+#define RM_NOTIMPLEMENTED      11
+#define RM_INVALID_PARAMETER  15
 #define CPU_REMAP               0x6f000
 #define CPU_REMAP1              0x6f004
 #define CPU_REMAP2              0x6f008
@@ -107,6 +116,7 @@ typedef struct SMP863XState {
     uint32_t timer_load;
     uint32_t led_uart_data;
     uint32_t led_uart_status;
+    bool irq_handler_installed;
 } SMP863XState;
 
 static const TypeInfo smp863x_pci_host_type = {
@@ -334,6 +344,12 @@ static uint32_t smp863x_regs_read32(SMP863XState *s, hwaddr addr)
 {
     uint32_t value = 0;
 
+    if (addr >= 0xee000 && addr <= 0xee314 &&
+        (addr & 0x300) != 0x200 &&
+        ((addr & 0xff) == 0xc || (addr & 0xff) == 0x14)) {
+        return s->regs[(addr & ~4ULL) / 4];
+    }
+
     switch (addr) {
     case IDE_CTRL_BLOCK:
     case IDE_STATUS_REG:
@@ -436,16 +452,55 @@ static uint64_t smp863x_regs_read(void *opaque, hwaddr addr, unsigned size)
     return (value >> ((addr & 3) * 8)) & ((UINT64_C(1) << (size * 8)) - 1);
 }
 
+/* Model the XOS mailbox protocol without claiming to execute XPU firmware. */
+static void smp863x_xrpc(SMP863XState *s)
+{
+    uint32_t request = s->regs[LR_XPU_STAGE / 4];
+    uint8_t header[36];
+    uint32_t result = RM_INVALID_PARAMETER;
+    uint32_t id = UINT32_MAX;
+    uint64_t ram_end = SMP863X_DRAM_BASE + memory_region_size(s->ram);
+
+    /* Requests must reside entirely in DRAM; never recurse into MMIO. */
+    if (!(request & 3) && request >= SMP863X_DRAM_BASE &&
+        (uint64_t)request + sizeof(header) <= ram_end &&
+        address_space_read(&address_space_memory, request,
+                           MEMTXATTRS_UNSPECIFIED, header,
+                           sizeof(header)) == MEMTX_OK) {
+        uint32_t length = ldl_le_p(header + 28);
+
+        id = ldl_le_p(header + 4);
+        if (length >= 32 && (uint64_t)request + length <= ram_end) {
+            result = RM_NOTIMPLEMENTED;
+            /* XLOAD certificate type 6 installs the IRQ handler. Its
+             * encrypted payload is represented by host-side behavior,
+             * rather than decoded or executed by an auxiliary CPU. */
+            if (id == 5 && length >= 32 + 1044 && header[34] == 6 &&
+                ldl_le_p(header + 8) == length - 32 - 1044) {
+                s->irq_handler_installed = true;
+                result = RM_OK;
+            }
+        }
+    }
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "smp863x XRPC: request=%08x id=%u result=%u ih=%u\n",
+                  request, id, result, s->irq_handler_installed);
+    s->regs[LR_XPU_STAGE / 4] = result;
+    s->regs[XPU_IRQ_SOFTSET / 4] &= ~SOFT_IRQ_XRPC;
+}
+
 static void smp863x_regs_write(void *opaque, hwaddr addr, uint64_t data,
                                 unsigned size)
 {
     SMP863XState *s = opaque;
     hwaddr aligned = addr & ~3;
     uint32_t value;
+    uint32_t write_bits;
 
     if (size != 1 && size != 2 && size != 4) {
         return;
     }
+    write_bits = (uint32_t)data << ((addr & 3) * 8);
     value = smp863x_regs_read32(s, aligned);
     if (size == 4) {
         value = data;
@@ -455,6 +510,32 @@ static void smp863x_regs_write(void *opaque, hwaddr addr, uint64_t data,
         value = (value & ~(mask << shift)) | ((data & mask) << shift);
     }
     addr = aligned;
+
+    /* XPU IRQ/FIQ/IIQ enable and software-request set/clear pairs. */
+    if (addr >= 0xee000 && addr <= 0xee314 &&
+        (addr & 0x300) != 0x200) {
+        unsigned reg = addr & 0xff;
+        if (reg == 8 || reg == 0xc || reg == 0x10 || reg == 0x14) {
+            hwaddr set = addr & ~4ULL;
+            uint32_t bits = write_bits;
+
+            if (reg & 4) {
+                s->regs[set / 4] &= ~bits;
+            } else {
+                s->regs[set / 4] |= bits;
+            }
+            if (addr == XPU_IRQ_SOFTSET) {
+                if (bits & SOFT_IRQ_XRPC) {
+                    smp863x_xrpc(s);
+                }
+                if (bits & SOFT_IRQ_IH_UNINSTALL) {
+                    s->irq_handler_installed = false;
+                    s->regs[set / 4] &= ~SOFT_IRQ_IH_UNINSTALL;
+                }
+            }
+            return;
+        }
+    }
 
     /* The six inbound PCI regions translate bus addresses to DRAM. Linux
      * programs these before issuing SATA DMA, including PRD table reads. */
@@ -594,6 +675,24 @@ static void smp863x_irqhandler_write(void *opaque, hwaddr addr, uint64_t data,
 static const MemoryRegionOps smp863x_irqhandler_ops = {
     .read = smp863x_irqhandler_read,
     .write = smp863x_irqhandler_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+};
+
+static uint64_t smp863x_media_read(void *opaque, hwaddr addr, unsigned size)
+{
+    return smp863x_regs_read(opaque, addr + 0x70000, size);
+}
+
+static void smp863x_media_write(void *opaque, hwaddr addr, uint64_t data,
+                                  unsigned size)
+{
+    smp863x_regs_write(opaque, addr + 0x70000, data, size);
+}
+
+static const MemoryRegionOps smp863x_media_ops = {
+    .read = smp863x_media_read,
+    .write = smp863x_media_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid = { .min_access_size = 1, .max_access_size = 4 },
 };
@@ -951,6 +1050,19 @@ static void smp863x_init_common(MachineState *machine, bool front_panel_uart)
     }
     memory_region_add_subregion(sysmem, 0x10000, regs);
     memory_region_add_subregion(sysmem, SMP863X_REG_BASE, cpuregs);
+    {
+        MemoryRegion *media = g_new(MemoryRegion, 1);
+        MemoryRegion *risc_ram = g_new(MemoryRegion, 1);
+
+        /* Display and six media-engine register blocks. */
+        memory_region_init_io(media, NULL, &smp863x_media_ops, s,
+                              "smp863x-media-registers", 0x70000);
+        memory_region_add_subregion(sysmem, 0x70000, media);
+        /* Six RISC program/data RAM pairs, each 128 KiB. */
+        memory_region_init_ram(risc_ram, NULL, "smp863x-media-risc-ram",
+                               0xc0000, &error_fatal);
+        memory_region_add_subregion(sysmem, 0x100000, risc_ram);
+    }
     {
         MemoryRegion *irqhandler = g_new(MemoryRegion, 1);
 
