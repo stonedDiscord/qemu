@@ -125,6 +125,19 @@ typedef struct SMP863XState {
     bool irq_handler_installed;
     bitbang_i2c_interface rtc_i2c;
     int rtc_sda;
+    bool front_panel;
+    MemoryRegion front_uart;
+    MemoryRegion front_irq_mask;
+    QEMUTimer *front_timer;
+    uint32_t front_regs[0x100 / 4];
+    uint16_t front_mask;
+    uint8_t front_rx[64];
+    unsigned front_rx_head;
+    unsigned front_rx_count;
+    uint8_t front_command;
+    bool front_command_pending;
+    uint8_t front_volume[3]; /* music, echo, mic */
+    uint8_t front_settings[64];
 } SMP863XState;
 
 /* uart.ko uses a 16-bit FPGA FIFO interface, not a 16550 register bank. */
@@ -473,6 +486,186 @@ static void smp863x_update_irq(SMP863XState *s)
     qemu_set_irq(s->cpu_irq, (s->irq_status & s->irq_enable) != 0);
 }
 
+/* Local behavioral model of the controller attached to CPU UART1.
+ * front_mod.ko services UART RX/TX from FPGA IRQ 23, not UART IRQ 10.
+ * A 1 ms service tick approximates the FPGA cadence; its exact period is
+ * not known. RX stays latched until the driver clears LSR bit 0 (it reads
+ * RBR several times while decoding a single byte).
+ */
+static void xg1000_front_reply(SMP863XState *s, uint8_t command, uint8_t data)
+{
+    unsigned tail;
+
+    if (s->front_rx_count > ARRAY_SIZE(s->front_rx) - 2) {
+        qemu_log_mask(LOG_GUEST_ERROR, "xg1000 front RX overflow\n");
+        return;
+    }
+    tail = (s->front_rx_head + s->front_rx_count) % ARRAY_SIZE(s->front_rx);
+    s->front_rx[tail] = command | ((data & 0x80) >> 1);
+    s->front_rx[(tail + 1) % ARRAY_SIZE(s->front_rx)] = data & 0x7f;
+    s->front_rx_count += 2;
+}
+
+static void xg1000_front_tx(SMP863XState *s, uint8_t byte)
+{
+    uint8_t command, data;
+
+    if (byte & 0x80) {
+        s->front_command = byte;
+        s->front_command_pending = true;
+        return;
+    }
+    if (!s->front_command_pending) {
+        return;
+    }
+    command = s->front_command & 0xbf;
+    data = byte | ((s->front_command & 0x40) << 1);
+    s->front_command_pending = false;
+    s->front_settings[command & 0x3f] = data;
+    if (command == 0x90) {
+        switch (data) {
+        case 3: /* Read the three volume positions. */
+            for (unsigned i = 0; i < 3; i++) {
+                xg1000_front_reply(s, 0xa3 + i, s->front_volume[i]);
+            }
+            break;
+        case 5: /* Program version: library expands 0x20 to 0x0200. */
+            xg1000_front_reply(s, 0xa6, 0x20);
+            break;
+        case 7: /* Samsung LTE700WQ-F05, as in the hardware boot log. */
+            xg1000_front_reply(s, 0xa7, 0);
+            break;
+        default:
+            break;
+        }
+    }
+}
+
+static void xg1000_front_tick(void *opaque)
+{
+    SMP863XState *s = opaque;
+
+    if (s->front_mask & 0xe00) {
+        s->irq_status |= 1U << 15;
+        smp863x_update_irq(s);
+        timer_mod_ns(s->front_timer,
+                     qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
+    }
+}
+
+static uint64_t xg1000_front_read(void *opaque, hwaddr addr, unsigned size)
+{
+    SMP863XState *s = opaque;
+    uint32_t value;
+
+    switch (addr & ~3ULL) {
+    case 0:
+        value = s->front_rx_count ? s->front_rx[s->front_rx_head] : 0;
+        break;
+    case 0x1c:
+        value = 0x60 | (s->front_rx_count != 0);
+        break;
+    default:
+        value = s->front_regs[addr / 4];
+        break;
+    }
+    return value >> ((addr & 3) * 8);
+}
+
+static void xg1000_front_write(void *opaque, hwaddr addr,
+                              uint64_t value, unsigned size)
+{
+    SMP863XState *s = opaque;
+    unsigned shift = (addr & 3) * 8;
+    uint32_t mask = (UINT32_MAX >> ((4 - size) * 8)) << shift;
+
+    s->front_regs[addr / 4] = (s->front_regs[addr / 4] & ~mask) |
+                             ((value << shift) & mask);
+    if (addr == 4) {
+        xg1000_front_tx(s, value);
+    } else if (addr == 0x1c && !(value & 1) && s->front_rx_count) {
+        s->front_rx_head = (s->front_rx_head + 1) % ARRAY_SIZE(s->front_rx);
+        s->front_rx_count--;
+    }
+}
+
+static const MemoryRegionOps xg1000_front_ops = {
+    .read = xg1000_front_read,
+    .write = xg1000_front_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+};
+
+static uint64_t xg1000_front_mask_read(void *opaque, hwaddr addr, unsigned size)
+{
+    SMP863XState *s = opaque;
+
+    return s->front_mask >> (addr * 8);
+}
+
+static void xg1000_front_mask_write(void *opaque, hwaddr addr,
+                                   uint64_t value, unsigned size)
+{
+    SMP863XState *s = opaque;
+    unsigned shift = addr * 8;
+    uint16_t mask = (size == 2 ? 0xffff : 0xff) << shift;
+
+    s->front_mask = (s->front_mask & ~mask) | ((value << shift) & mask);
+    if (s->front_mask & 0xe00) {
+        timer_mod_ns(s->front_timer,
+                     qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
+    } else {
+        timer_del(s->front_timer);
+        s->irq_status &= ~(1U << 15);
+        smp863x_update_irq(s);
+    }
+}
+
+static const MemoryRegionOps xg1000_front_mask_ops = {
+    .read = xg1000_front_mask_read,
+    .write = xg1000_front_mask_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 2 },
+};
+
+static void xg1000_front_reset(void *opaque)
+{
+    SMP863XState *s = opaque;
+
+    timer_del(s->front_timer);
+    s->front_mask = 0;
+    s->front_rx_head = s->front_rx_count = 0;
+    s->front_command_pending = false;
+    memset(s->front_regs, 0, sizeof(s->front_regs));
+    memset(s->front_settings, 0, sizeof(s->front_settings));
+    s->front_volume[0] = 4;
+    s->front_volume[1] = 48;
+    s->front_volume[2] = 77;
+    s->irq_status &= ~(1U << 15);
+    smp863x_update_irq(s);
+}
+
+static void xg1000_front_init(SMP863XState *s, MemoryRegion *sysmem)
+{
+    s->front_panel = true;
+    s->front_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, xg1000_front_tick, s);
+    memory_region_init_io(&s->front_uart, NULL, &xg1000_front_ops, s,
+                          "xg1000-front-uart", 0x100);
+    memory_region_init_io(&s->front_irq_mask, NULL, &xg1000_front_mask_ops, s,
+                          "xg1000-front-irq-mask", 2);
+    memory_region_add_subregion_overlap(sysmem, CPU_UART1_BASE,
+                                        &s->front_uart, 3);
+    MemoryRegion *alias = g_new(MemoryRegion, 1);
+    memory_region_init_alias(alias, NULL, "xg1000-front-uart-kseg1",
+                             &s->front_uart, 0, 0x100);
+    memory_region_add_subregion_overlap(sysmem, 0xa0000000ULL + CPU_UART1_BASE,
+                                        alias, 3);
+    memory_region_add_subregion_overlap(sysmem, 0x4c00d800,
+                                        &s->front_irq_mask, 3);
+    qemu_register_reset(xg1000_front_reset, s);
+    xg1000_front_reset(s);
+}
+
 static int smp863x_pci_map_irq(PCIDevice *dev, int pin)
 {
     /* Linux records its XENV-selected route in PCI_INTERRUPT_LINE. */
@@ -602,6 +795,7 @@ static uint32_t smp863x_regs_read32(SMP863XState *s, hwaddr addr)
     case 0x6c204: /* Front-panel LED UART data register. */
         return s->led_uart_data;
     case CPU_IRQ_STATUS:
+    case CPU_IRQ_RAWSTAT:
         return s->irq_status;
     case CPU_EDGE_RAWSTAT:
         return s->irq_status;  /* kernel polls this for live pending bits */
@@ -1269,6 +1463,7 @@ static void smp863x_init_common(MachineState *machine, bool front_panel_uart)
     }
     if (front_panel_uart) {
         xg1000_uart_init(sysmem);
+        xg1000_front_init(s, sysmem);
     }
     memory_region_add_subregion(sysmem, 0x10000, regs);
     memory_region_add_subregion(sysmem, SMP863X_REG_BASE, cpuregs);
