@@ -95,6 +95,10 @@ int bitbang_i2c_set(bitbang_i2c_interface *i2c, int line, int level)
         }
         if (level == 0) {
             /* START condition.  */
+            /* A new address follows even if the master omitted STOP.
+             * Drop the old selection so a different slave can respond.
+             */
+            i2c_end_transfer(i2c->bus);
             bitbang_i2c_set_state(i2c, SENDING_BIT7);
             i2c->current_addr = -1;
         } else {

@@ -191,6 +191,7 @@ struct XG1000RTCState {
     uint8_t ram[16];
     uint8_t ptr;
     bool address_byte;
+    bool general_call;
     int64_t offset;
 };
 
@@ -215,6 +216,7 @@ static int xg1000_rtc_event(I2CSlave *dev, enum i2c_event event)
     XG1000RTCState *s = XG1000_RTC(dev);
 
     if (event == I2C_START_SEND) {
+        s->general_call = I2C_BUS(qdev_get_parent_bus(DEVICE(dev)))->broadcast;
         s->address_byte = true;
     } else if (event == I2C_START_RECV) {
         xg1000_rtc_capture(s);
@@ -238,6 +240,10 @@ static int xg1000_rtc_send(I2CSlave *dev, uint8_t data)
     struct tm now;
     unsigned reg;
 
+    /* PCF8593 does not respond to the I2C general-call address. */
+    if (s->general_call) {
+        return -1;
+    }
     if (s->address_byte) {
         s->ptr = data & 0x0f;
         s->address_byte = false;
