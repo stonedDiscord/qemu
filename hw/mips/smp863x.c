@@ -124,6 +124,57 @@ typedef struct SMP863XState {
     int rtc_sda;
 } SMP863XState;
 
+/* uart.ko uses a 16-bit FPGA FIFO interface, not a 16550 register bank. */
+typedef struct XG1000UART {
+    MemoryRegion mmio;
+    CharFrontend chr;
+    uint16_t baud;
+} XG1000UART;
+
+static uint64_t xg1000_uart_read(void *opaque, hwaddr addr, unsigned size)
+{
+    /* No peripheral is attached: both FIFO counts are zero. */
+    return 0;
+}
+
+static void xg1000_uart_write(void *opaque, hwaddr addr,
+                             uint64_t value, unsigned size)
+{
+    XG1000UART *s = opaque;
+
+    if (addr == 0) {
+        uint8_t byte = value;
+        qemu_chr_fe_write_all(&s->chr, &byte, 1);
+    } else if (addr == 8) {
+        s->baud = value;
+    }
+}
+
+static const MemoryRegionOps xg1000_uart_ops = {
+    .read = xg1000_uart_read,
+    .write = xg1000_uart_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 2, .max_access_size = 2 },
+};
+
+static void xg1000_uart_init(MemoryRegion *sysmem)
+{
+    static const hwaddr bases[] = { 0x4c009000, 0x4c010800, 0x4c012800 };
+
+    for (unsigned i = 0; i < ARRAY_SIZE(bases); i++) {
+        XG1000UART *s = g_new0(XG1000UART, 1);
+        g_autofree char *name = g_strdup_printf("xg1000-fpga-uart%u", i + 1);
+        Chardev *chr = serial_hd(i + 2);
+
+        if (!chr) {
+            chr = qemu_chr_new(name, "vc:80Cx24C", NULL);
+        }
+        qemu_chr_fe_init(&s->chr, chr, &error_fatal);
+        memory_region_init_io(&s->mmio, NULL, &xg1000_uart_ops, s, name, 0x800);
+        memory_region_add_subregion_overlap(sysmem, bases[i], &s->mmio, 3);
+    }
+}
+
 /* PCF8593 clock/calendar and RAM used by the XG1000 firmware.
  * Alarm/event-counter modes and the unconnected interrupt pin are not modeled.
  */
@@ -317,31 +368,6 @@ typedef struct SMP863XRemapWindow {
     SMP863XState *s;
     unsigned index;
 } SMP863XRemapWindow;
-
-/* XG1000's UART1 is wired to the front-panel LED controller.  It is a
- * write-only serial slave: the kernel polls the UART line status before
- * shifting each LED byte and expects transmitter-ready (bit 5). */
-static uint64_t smp863x_front_panel_read(void *opaque, hwaddr addr,
-                                         unsigned size)
-{
-    if ((addr & 0x1f) == 0x1c) {
-        return 0x60;
-    }
-    return 0;
-}
-
-static void smp863x_front_panel_write(void *opaque, hwaddr addr,
-                                      uint64_t data, unsigned size)
-{
-    /* The physical front-panel controller consumes UART1 transmit bytes. */
-}
-
-static const MemoryRegionOps smp863x_front_panel_ops = {
-    .read = smp863x_front_panel_read,
-    .write = smp863x_front_panel_write,
-    .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid = { .min_access_size = 1, .max_access_size = 4 },
-};
 
 static uint64_t smp863x_remap_read(void *opaque, hwaddr addr, unsigned size)
 {
@@ -1169,7 +1195,9 @@ static void smp863x_init_common(MachineState *machine, bool front_panel_uart)
     uart0 = serial_mm_tangox_init(sysmem, CPU_UART0_BASE, uart_irqs[0], 115200,
                                   serial_hd(0), DEVICE_LITTLE_ENDIAN);
     uart1 = serial_mm_tangox_init(sysmem, CPU_UART1_BASE, uart_irqs[1], 115200,
-                                  serial_hd(1), DEVICE_LITTLE_ENDIAN);
+                                  serial_hd(1) ?: qemu_chr_new("smp863x-uart1",
+                                      "vc:80Cx24C", NULL),
+                                  DEVICE_LITTLE_ENDIAN);
     {
         MemoryRegion *uart0_kseg1 = g_new(MemoryRegion, 1);
         MemoryRegion *uart1_kseg1 = g_new(MemoryRegion, 1);
@@ -1204,18 +1232,7 @@ static void smp863x_init_common(MachineState *machine, bool front_panel_uart)
         memory_region_add_subregion_overlap(sysmem, 0x3f8, uart0_pc, 1);
     }
     if (front_panel_uart) {
-        MemoryRegion *front_panel = g_new(MemoryRegion, 1);
-        MemoryRegion *front_panel_kseg1 = g_new(MemoryRegion, 1);
-        memory_region_init_io(front_panel, NULL, &smp863x_front_panel_ops,
-                              NULL, "xg1000-front-panel-uart1", 0x100);
-        memory_region_init_alias(front_panel_kseg1, NULL,
-                                 "xg1000-front-panel-uart1-kseg1",
-                                 front_panel, 0, 0x100);
-        memory_region_add_subregion_overlap(sysmem, CPU_UART1_BASE,
-                                            front_panel, 2);
-        memory_region_add_subregion_overlap(sysmem,
-                                            0xa0000000ULL + CPU_UART1_BASE,
-                                            front_panel_kseg1, 2);
+        xg1000_uart_init(sysmem);
     }
     memory_region_add_subregion(sysmem, 0x10000, regs);
     memory_region_add_subregion(sysmem, SMP863X_REG_BASE, cpuregs);

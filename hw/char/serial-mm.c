@@ -36,19 +36,24 @@ static uint64_t serial_mm_read(void *opaque, hwaddr addr, unsigned size)
     unsigned reg = addr >> s->regshift;
 
     if (s->tangox_layout) {
-        switch (reg & 7) {
-        case 5:
-            reg = 3;
-            break;
-        case 6:
-            reg = 4;
-            break;
-        case 7:
-            reg = 5;
-            break;
-        default:
-            break;
+        switch (reg) {
+        case 0: reg = 0; break;
+        case 2: reg = 1; break;
+        case 3: reg = 2; break;
+        case 5: reg = 3; break;
+        case 6: reg = 4; break;
+        case 7: reg = 5; break;
+        case 8: reg = 6; break;
+        case 9: reg = 7; break;
+        case 10: return s->serial.divider;
+        default: return 0;
         }
+        /* TangoX has a separate divisor register; DLAB never aliases RBR/IER. */
+        uint8_t lcr = s->serial.lcr;
+        s->serial.lcr &= ~0x80;
+        uint64_t value = serial_io_ops.read(&s->serial, reg, 1);
+        s->serial.lcr = lcr;
+        return value;
     }
     return serial_io_ops.read(&s->serial, reg, 1);
 }
@@ -60,15 +65,31 @@ static void serial_mm_write(void *opaque, hwaddr addr,
     unsigned reg = addr >> s->regshift;
 
     if (s->tangox_layout) {
-        switch (reg & 7) {
+        switch (reg) {
         case 1: reg = 0; break;
         case 2: reg = 1; break;
-        case 3: reg = 2; break;
         case 4: reg = 2; break;
         case 5: reg = 3; break;
         case 6: reg = 4; break;
-        case 7: reg = 5; break;
-        default: break;
+        case 9: reg = 7; break;
+        case 10:
+            /* Program both bytes through the 16550 divisor latch. */
+            {
+                uint8_t lcr = s->serial.lcr;
+                s->serial.lcr |= 0x80;
+                serial_io_ops.write(&s->serial, 0, value & 255, 1);
+                serial_io_ops.write(&s->serial, 1, (value >> 8) & 255, 1);
+                s->serial.lcr = lcr;
+            }
+            return;
+        default: return;
+        }
+        if (reg == 0 || reg == 1) {
+            uint8_t lcr = s->serial.lcr;
+            s->serial.lcr &= ~0x80;
+            serial_io_ops.write(&s->serial, reg, value & 255, 1);
+            s->serial.lcr = lcr;
+            return;
         }
     }
     value &= 255;
@@ -110,7 +131,7 @@ static void serial_mm_realize(DeviceState *dev, Error **errp)
 
     memory_region_init_io(&s->io, OBJECT(dev),
                           &serial_mm_ops[smm->endianness], smm, "serial",
-                          8 << smm->regshift);
+                          smm->tangox_layout ? 0x100 : 8 << smm->regshift);
     sysbus_init_mmio(SYS_BUS_DEVICE(smm), &s->io);
     sysbus_init_irq(SYS_BUS_DEVICE(smm), &smm->serial.irq);
 }
