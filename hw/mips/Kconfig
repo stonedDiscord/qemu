@@ -86,3 +86,8 @@ config MIPS_BOSTON
 
 config FW_CFG_MIPS
     bool
+
+config SMP863X
+    bool
+    default y
+    select BITBANG_I2C

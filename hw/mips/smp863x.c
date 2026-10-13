@@ -3,6 +3,9 @@
 #include "qemu/osdep.h"
 #include "qemu/units.h"
 #include "qemu/timer.h"
+#include "qemu/bcd.h"
+#include "system/rtc.h"
+#include "hw/i2c/bitbang_i2c.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "qemu/log.h"
@@ -117,7 +120,140 @@ typedef struct SMP863XState {
     uint32_t led_uart_data;
     uint32_t led_uart_status;
     bool irq_handler_installed;
+    bitbang_i2c_interface rtc_i2c;
+    int rtc_sda;
 } SMP863XState;
+
+/* PCF8593 clock/calendar and RAM used by the XG1000 firmware.
+ * Alarm/event-counter modes and the unconnected interrupt pin are not modeled.
+ */
+#define TYPE_XG1000_RTC "xg1000-pcf8593"
+OBJECT_DECLARE_SIMPLE_TYPE(XG1000RTCState, XG1000_RTC)
+
+struct XG1000RTCState {
+    I2CSlave parent_obj;
+    uint8_t ram[16];
+    uint8_t ptr;
+    bool address_byte;
+    int64_t offset;
+};
+
+static void xg1000_rtc_capture(XG1000RTCState *s)
+{
+    struct tm now;
+
+    if (s->ram[0] & 0x80) { /* STOP */
+        return;
+    }
+    qemu_get_timedate(&now, s->offset);
+    s->ram[1] = 0;
+    s->ram[2] = to_bcd(now.tm_sec);
+    s->ram[3] = to_bcd(now.tm_min);
+    s->ram[4] = to_bcd(now.tm_hour);
+    s->ram[5] = to_bcd(now.tm_mday) | ((now.tm_year & 3) << 6);
+    s->ram[6] = to_bcd(now.tm_mon + 1) | (now.tm_wday << 5);
+}
+
+static int xg1000_rtc_event(I2CSlave *dev, enum i2c_event event)
+{
+    XG1000RTCState *s = XG1000_RTC(dev);
+
+    if (event == I2C_START_SEND) {
+        s->address_byte = true;
+    } else if (event == I2C_START_RECV) {
+        xg1000_rtc_capture(s);
+    }
+    return 0;
+}
+
+static uint8_t xg1000_rtc_recv(I2CSlave *dev)
+{
+    XG1000RTCState *s = XG1000_RTC(dev);
+
+    uint8_t value = s->ram[s->ptr];
+
+    s->ptr = (s->ptr + 1) & 0x0f;
+    return value;
+}
+
+static int xg1000_rtc_send(I2CSlave *dev, uint8_t data)
+{
+    XG1000RTCState *s = XG1000_RTC(dev);
+    struct tm now;
+    unsigned reg;
+
+    if (s->address_byte) {
+        s->ptr = data & 0x0f;
+        s->address_byte = false;
+        return 0;
+    }
+    reg = s->ptr;
+    s->ptr = (s->ptr + 1) & 0x0f;
+    if (reg >= 2 && reg <= 6) {
+        qemu_get_timedate(&now, s->offset);
+        switch (reg) {
+        case 2:
+            now.tm_sec = from_bcd(data & 0x7f);
+            break;
+        case 3:
+            now.tm_min = from_bcd(data & 0x7f);
+            break;
+        case 4:
+            now.tm_hour = from_bcd(data & 0x3f);
+            break;
+        case 5:
+            now.tm_mday = from_bcd(data & 0x3f);
+            now.tm_year = (now.tm_year & ~3) | (data >> 6);
+            break;
+        case 6:
+            now.tm_mon = from_bcd(data & 0x1f) - 1;
+            break;
+        }
+        s->offset = qemu_timedate_diff(&now);
+    }
+    s->ram[reg] = data;
+    return 0;
+}
+
+static void xg1000_rtc_realize(DeviceState *dev, Error **errp)
+{
+    XG1000RTCState *s = XG1000_RTC(dev);
+    struct tm now;
+    unsigned year;
+
+    qemu_get_timedate(&now, 0);
+    year = now.tm_year + 1900;
+    /* Firmware-specific BCD year storage in battery-backed RAM. */
+    s->ram[8] = to_bcd(year / 100);
+    s->ram[9] = to_bcd(year % 100);
+    xg1000_rtc_capture(s);
+}
+
+static void xg1000_rtc_class_init(ObjectClass *klass, const void *data)
+{
+    I2CSlaveClass *ic = I2C_SLAVE_CLASS(klass);
+    DeviceClass *dc = DEVICE_CLASS(klass);
+
+    ic->event = xg1000_rtc_event;
+    ic->recv = xg1000_rtc_recv;
+    ic->send = xg1000_rtc_send;
+    dc->realize = xg1000_rtc_realize;
+    dc->desc = "XG1000 PCF8593 clock/calendar";
+}
+
+static const TypeInfo xg1000_rtc_type = {
+    .name = TYPE_XG1000_RTC,
+    .parent = TYPE_I2C_SLAVE,
+    .instance_size = sizeof(XG1000RTCState),
+    .class_init = xg1000_rtc_class_init,
+};
+
+static void xg1000_rtc_register_type(void)
+{
+    type_register_static(&xg1000_rtc_type);
+}
+
+type_init(xg1000_rtc_register_type)
 
 static const TypeInfo smp863x_pci_host_type = {
     .name = "smp863x-pci-host",
@@ -351,6 +487,8 @@ static uint32_t smp863x_regs_read32(SMP863XState *s, hwaddr addr)
     }
 
     switch (addr) {
+    case 0x10504:
+        return (s->regs[addr / 4] & ~2U) | (s->rtc_sda << 1);
     case IDE_CTRL_BLOCK:
     case IDE_STATUS_REG:
     case IDE_STATUS_REG_ALT:
@@ -510,6 +648,25 @@ static void smp863x_regs_write(void *opaque, hwaddr addr, uint64_t data,
         value = (value & ~(mask << shift)) | ((data & mask) << shift);
     }
     addr = aligned;
+
+    /* GPIO writes use high-half enables and low-half values. GPIO0/1
+     * carry the board's bit-banged SCL/SDA; inputs release the bus high.
+     */
+    if (addr == 0x10500 || addr == 0x10504 ||
+        addr == 0x2710c || addr == 0x27110) {
+        uint32_t mask = write_bits >> 16;
+        s->regs[addr / 4] = (s->regs[addr / 4] & ~mask) |
+                              (write_bits & mask);
+        if (addr == 0x10500 || addr == 0x10504) {
+            uint32_t dir = s->regs[0x10500 / 4];
+            uint32_t pins = s->regs[0x10504 / 4] | ~dir;
+            s->rtc_sda = bitbang_i2c_set(&s->rtc_i2c, BITBANG_I2C_SDA,
+                                        (pins >> 1) & 1);
+            s->rtc_sda = bitbang_i2c_set(&s->rtc_i2c, BITBANG_I2C_SCL,
+                                        pins & 1);
+        }
+        return;
+    }
 
     /* XPU IRQ/FIQ/IIQ enable and software-request set/clear pairs. */
     if (addr >= 0xee000 && addr <= 0xee314 &&
@@ -821,6 +978,18 @@ static void smp863x_init_common(MachineState *machine, bool front_panel_uart)
     if (machine->ram_size < 80 * MiB) {
         error_report("smp863x requires at least 80 MiB of RAM");
         exit(EXIT_FAILURE);
+    }
+
+    {
+        DeviceState *bridge = qdev_new(TYPE_GPIO_I2C);
+        I2CBus *bus;
+
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(bridge), &error_fatal);
+        bus = I2C_BUS(qdev_get_child_bus(bridge, "i2c"));
+        bitbang_i2c_init(&s->rtc_i2c, bus);
+        s->rtc_i2c.current_addr = -1;
+        s->rtc_sda = 1;
+        i2c_slave_create_simple(bus, TYPE_XG1000_RTC, 0x51);
     }
 
     cpuclk = clock_new(OBJECT(machine), "cpu-refclk");
