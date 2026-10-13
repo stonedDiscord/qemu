@@ -90,5 +90,6 @@ config FW_CFG_MIPS
 config SMP863X
     bool
     default y
+    select PFLASH_CFI02
     select BITBANG_I2C
     select AT24C

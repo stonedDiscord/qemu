@@ -378,6 +378,14 @@ static uint64_t smp863x_remap_read(void *opaque, hwaddr addr, unsigned size)
     SMP863XState *s = window->s;
     uint64_t value = 0;
 
+    if ((s->remap[window->index] == 0x48000000U ||
+         s->remap[window->index] == SMP863X_PFLASH_BASE) &&
+        addr + size <= SMP863X_PFLASH_SIZE) {
+        memory_region_dispatch_read(s->flash, addr, &value, size_memop(size),
+                                    MEMTXATTRS_UNSPECIFIED);
+        return value;
+    }
+
     if (s->remap[window->index] >= SMP863X_DRAM_BASE &&
         (uint64_t)s->remap[window->index] + addr + size <=
             SMP863X_DRAM_BASE + memory_region_size(s->ram)) {
@@ -1011,7 +1019,7 @@ static void smp863x_init_common(MachineState *machine, bool front_panel_uart)
     SerialMM *uart0, *uart1;
     ssize_t kernel_size;
     DriveInfo *dinfo;
-    PFlashCFI01 *pflash;
+    PFlashCFI02 *pflash;
     uint8_t *flash_data = NULL;
 
     if (machine->ram_size < 80 * MiB) {
@@ -1112,11 +1120,12 @@ static void smp863x_init_common(MachineState *machine, bool front_panel_uart)
     }
     /* The input image has a small capture footer, so use it only as the
      * source snapshot and keep the emulated CFI geometry canonical. */
-    pflash = pflash_cfi01_register(SMP863X_PFLASH_BASE, "smp863x.pflash",
-                                   SMP863X_PFLASH_SIZE, NULL,
-                                   0x10000, 2, 0x0000, 0x0000, 0x0000, 0x0000,
-                                   DEVICE_LITTLE_ENDIAN);
-    s->flash = pflash_cfi01_get_memory(pflash);
+    /* S29GL064M: one x16 AMD-command-set chip, 128 64 KiB sectors. */
+    pflash = pflash_cfi02_register(SMP863X_PFLASH_BASE, "smp863x.pflash",
+                                 SMP863X_PFLASH_SIZE, NULL,
+                                 0x10000, 1, 2, 0x0001, 0x227e, 0x220c, 0x2201,
+                                 0x555, 0x2aa, 0);
+    s->flash = sysbus_mmio_get_region(SYS_BUS_DEVICE(pflash), 0);
     if (dinfo && blk_attach_dev(blk_by_legacy_dinfo(dinfo), DEVICE(pflash)) < 0) {
         error_report("could not claim SMP863x parallel flash backend");
         exit(EXIT_FAILURE);
