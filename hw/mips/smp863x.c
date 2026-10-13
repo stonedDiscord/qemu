@@ -56,7 +56,7 @@
 #define CPU_IRQ_RAWSTAT         0x6e004
 #define CPU_EDGE_RAWSTAT        0x6e204  /* write-1-to-clear; kernel acks IRQs here */
 #define CPU_TIMER0_CTRL         0x6c508
-#define CPU_TIMER0_LOAD         0x6c504
+#define CPU_TIMER0_LOAD         0x6c500
 #define CPU_TIMER0_CLR          0x6c50c
 #define IDE_CTRL_BLOCK          0x22398
 #define IDE_STATUS_REG          0x223dc
@@ -87,6 +87,9 @@ typedef struct SMP863XState {
     MemoryRegion pci_config;
     MemoryRegion pci_io;
     MemoryRegion pci_memory;
+    MemoryRegion pci_dma;
+    MemoryRegion pci_dma_regions[6];
+    AddressSpace pci_dma_as;
     PCIBus *pci_bus;
     uint8_t *flash_data;
     size_t flash_data_size;
@@ -119,29 +122,29 @@ static void smp863x_register_pci_host(void)
 
 type_init(smp863x_register_pci_host)
 
+static AddressSpace *smp863x_pci_dma_as(PCIBus *bus, void *opaque, int devfn)
+{
+    SMP863XState *s = opaque;
+
+    return &s->pci_dma_as;
+}
+
+static const PCIIOMMUOps smp863x_pci_iommu_ops = {
+    .get_address_space = smp863x_pci_dma_as,
+};
+
 /* Tangox maps PCI configuration space as bus/devfn/offset bytes. */
 static uint64_t smp863x_pci_config_read(void *opaque, hwaddr addr,
                                         unsigned size)
 {
     SMP863XState *s = opaque;
-    uint32_t value;
 
     if (!s->pci_bus || size > 4 || addr >= SMP863X_PCI_CONFIG_SIZE ||
         addr + size > SMP863X_PCI_CONFIG_SIZE || (size > 1 && (addr & 1)) ||
         (size == 4 && (addr & 3))) {
         return UINT32_MAX;
     }
-    /* The Tangox bridge exposes IDSEL 4 through a narrow, board-specific
-     * window. Keep the SiI3112 identity visible even when QEMU's generic
-     * PCI host has not populated the slot's legacy config shadow yet. */
-    if (addr == 0x2000 && size == 4) {
-        uint32_t v = pci_data_read(s->pci_bus, addr, size);
-        if (v == UINT32_MAX) {
-            return 0x31121095;
-        }
-    }
-    value = pci_data_read(s->pci_bus, addr, size);
-    return value;
+    return pci_data_read(s->pci_bus, addr, size);
 }
 
 static void smp863x_pci_config_write(void *opaque, hwaddr addr,
@@ -279,6 +282,9 @@ static int smp863x_pci_map_irq(PCIDevice *dev, int pin)
     /* Linux records its XENV-selected route in PCI_INTERRUPT_LINE. */
     unsigned line = dev->config[PCI_INTERRUPT_LINE];
 
+    if (PCI_SLOT(dev->devfn) == 4) {
+        return 3;
+    }
     return line >= 21 && line <= 24 ? line - 21 : pin;
 }
 
@@ -335,11 +341,13 @@ static uint32_t smp863x_regs_read32(SMP863XState *s, hwaddr addr)
         /* No ATA device is attached, but the controller is idle and ready. */
         return 0x00000050;
     case 0x10000 + 0x003c: /* SYS_sysclk_mux: ES6, PLL, CPU divider. */
-        return 0x00000301;
+        return 0x00000201;
     case 0x10000 + 0x0034: /* SYS_sysclk_premux */
         return 0;
     case 0x10000 + 0x0000: /* SYS_clkgen0_pll */
-        return 0x01000016;
+        return 0x01010041;
+    case 0x10000 + 0x0018: /* SYS_clkgen3_pll: 603 MHz before dividers. */
+        return 0x01010041;
     case 0x10000 + 0x0048: /* SYS_xtal_in_cnt, 27 MHz */
         return s->xtal_counter += 1000;
     case 0x20000 + 0xfee8: /* PCI_REG0 */
@@ -356,9 +364,9 @@ static uint32_t smp863x_regs_read32(SMP863XState *s, hwaddr addr)
     case 0x26014: /* Ethernet MDIO command/status: idle. */
         return 0;
     case 0x26018: /* Ethernet MDIO data: the board PHY is at address 9. */
-        /* The legacy driver decodes the PHY address from the low MDIO
-         * status nibble; 0x940 is address 1 and 0x948 is address 9. */
-        return 0x00000948;
+        /* MIIAR selects the PHY; unpopulated addresses float high. */
+        return ((s->regs[0x26014 / 4] >> 11) & 0x1f) == 9 ?
+               0x00000948 : 0xffff;
     case TANGOX_USB_CTL_BASE:
         return 0x00000070; /* controller enabled, clocks stable */
     case TANGOX_USB_CTL_BASE + 0x8:
@@ -370,8 +378,6 @@ static uint32_t smp863x_regs_read32(SMP863XState *s, hwaddr addr)
     case TANGOX_GPIO_BASE + 4:
         return 0;
     case TANGOX_GPIO_BASE + 8:
-        return 0;
-    case TANGOX_IR_BASE:
         return 0;
     case TANGOX_IR_BASE + 0x2c:
         return 0;
@@ -449,6 +455,25 @@ static void smp863x_regs_write(void *opaque, hwaddr addr, uint64_t data,
         value = (value & ~(mask << shift)) | ((data & mask) << shift);
     }
     addr = aligned;
+
+    /* The six inbound PCI regions translate bus addresses to DRAM. Linux
+     * programs these before issuing SATA DMA, including PRD table reads. */
+    if (addr >= 0x29008 && addr <= 0x2901c) {
+        unsigned region = (addr - 0x29008) / 4;
+        uint64_t offset = (uint64_t)value - SMP863X_DRAM_BASE;
+        bool valid = value >= SMP863X_DRAM_BASE &&
+                     offset < memory_region_size(s->ram);
+
+        memory_region_transaction_begin();
+        if (valid) {
+            memory_region_set_alias_offset(&s->pci_dma_regions[region], offset);
+            memory_region_set_size(&s->pci_dma_regions[region],
+                                   MIN(16 * MiB,
+                                       memory_region_size(s->ram) - offset));
+        }
+        memory_region_set_enabled(&s->pci_dma_regions[region], valid);
+        memory_region_transaction_commit();
+    }
 
     switch (addr) {
     case 0x6c204: /* LED controller receives the selected segment byte. */
@@ -947,6 +972,18 @@ static void smp863x_init_common(MachineState *machine, bool front_panel_uart)
                                   &s->pci_memory, &s->pci_io, 0,
                                   TYPE_PCI_BUS);
     PCI_HOST_BRIDGE(pci_host)->bus = s->pci_bus;
+    memory_region_init(&s->pci_dma, OBJECT(pci_host), "smp863x-pci-dma",
+                       UINT64_C(1) << 32);
+    address_space_init(&s->pci_dma_as, &s->pci_dma, "smp863x-pci-dma");
+    for (unsigned i = 0; i < ARRAY_SIZE(s->pci_dma_regions); i++) {
+        memory_region_init_alias(&s->pci_dma_regions[i], OBJECT(pci_host),
+                                 "smp863x-pci-dma-region", machine->ram,
+                                 0, 16 * MiB);
+        memory_region_set_enabled(&s->pci_dma_regions[i], false);
+        memory_region_add_subregion(&s->pci_dma, 0x12000000ULL + i * 16 * MiB,
+                                    &s->pci_dma_regions[i]);
+    }
+    pci_setup_iommu(s->pci_bus, &smp863x_pci_iommu_ops, s);
     pci_bus_map_irqs(s->pci_bus, smp863x_pci_map_irq);
     pci_bus_irqs(s->pci_bus, smp863x_pci_set_irq, s, 4);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(pci_host), &error_fatal);
@@ -954,7 +991,6 @@ static void smp863x_init_common(MachineState *machine, bool front_panel_uart)
     {
         PCIDevice *sata = pci_create_simple(s->pci_bus, PCI_DEVFN(4, 0),
                                             "sii3114");
-
         sata->config[PCI_INTERRUPT_LINE] = 24;
         const char *ids[] = { "xga", "xgb", "xgc", "xgd" };
         for (int port = 0; port < 4; port++) {
@@ -1037,7 +1073,7 @@ static void xg1000_machine_init(MachineClass *mc)
 {
     mc->desc = "Osung Midicom XG1000 karaoke player";
     mc->init = xg1000_init;
-    mc->default_cpu_type = MIPS_CPU_TYPE_NAME("34Kf");
+    mc->default_cpu_type = MIPS_CPU_TYPE_NAME("SMP8634");
     mc->default_ram_size = 128 * MiB;
     mc->default_ram_id = "xg1000.ram";
     mc->max_cpus = 1;
