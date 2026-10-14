@@ -140,10 +140,54 @@ typedef struct XG1000UART {
     CharFrontend chr;
     uint16_t baud;
     bool yamaha;
+    bool tg;
     uint8_t rx[512], tx[256];
     unsigned rx_head, rx_count, tx_count;
     int64_t next_power_status;
 } XG1000UART;
+
+/* Initialization-only TG model inferred from libymhOkdPlayer.so.
+ * The two TGs return 0xfe at startup, then a bulk version response.
+ * No tone generation or firmware download is implemented. */
+static void xg1000_tg_tx(XG1000UART *s, uint8_t byte)
+{
+    static const uint8_t request[] = {
+        0xf0, 0x43, 0x30, 0x31, 3, 0, 0, 0, 0, 0x10, 0x6d, 0xf7
+    };
+    uint8_t reply[] = {
+        0xf0, 0x43, 0, 0x31, 3, 0, 0, 0x23, 'M', '0', '0',
+        0, 0, 0, 0, 0, 0, 0, '2', '.', '0', '5', 0, 0xf7
+    };
+    unsigned sum = 0;
+
+    if (byte == 0xf0) {
+        s->tx_count = 0;
+    }
+    if (s->tx_count == sizeof(s->tx)) {
+        s->tx_count = 0;
+        return;
+    }
+    s->tx[s->tx_count++] = byte;
+    if (byte != 0xf7) {
+        return;
+    }
+    if (s->tx_count == sizeof(request) &&
+        !memcmp(s->tx, request, sizeof(request))) {
+        /* Stop repeating the startup notification once queried. */
+        s->next_power_status = INT64_MAX;
+        for (unsigned i = 4; i < sizeof(reply) - 2; i++) {
+            sum += reply[i];
+        }
+        reply[sizeof(reply) - 2] = -sum & 0x7f;
+        if (sizeof(reply) <= sizeof(s->rx) - s->rx_count) {
+            for (unsigned i = 0; i < sizeof(reply); i++) {
+                s->rx[(s->rx_head + s->rx_count++) % sizeof(s->rx)] =
+                    reply[i];
+            }
+        }
+    }
+    s->tx_count = 0;
+}
 
 /* Local initialization-only Yamaha DSP model, inferred from
  * libymhAudioDriver.so. It does not execute DSP firmware. */
@@ -201,10 +245,15 @@ static uint64_t xg1000_uart_read(void *opaque, hwaddr addr, unsigned size)
 {
     XG1000UART *s = opaque;
 
-    if (s->yamaha) {
+    if (s->yamaha || s->tg) {
         if (addr == 8 && qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) >=
                          s->next_power_status) {
-            xg1000_yamaha_reply(s, 1, 0x7f);
+            if (s->yamaha) {
+                xg1000_yamaha_reply(s, 1, 0x7f);
+            } else if (!s->rx_count) {
+                s->rx[s->rx_head] = 0xfe;
+                s->rx_count = 1;
+            }
             s->next_power_status = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                                    NANOSECONDS_PER_SECOND;
         }
@@ -230,10 +279,15 @@ static void xg1000_uart_write(void *opaque, hwaddr addr,
         uint8_t byte = value;
         if (s->yamaha) {
             xg1000_yamaha_tx(s, byte);
+        } else if (s->tg) {
+            xg1000_tg_tx(s, byte);
         }
         qemu_chr_fe_write_all(&s->chr, &byte, 1);
     } else if (addr == 8) {
         s->baud = value;
+        if (s->tg) {
+            s->next_power_status = 0;
+        }
     }
 }
 
@@ -276,6 +330,8 @@ static void xg1000_uart_init(MemoryRegion *sysmem)
     for (unsigned i = 0; i < ARRAY_SIZE(ports); i++) {
         XG1000UART *s = g_new0(XG1000UART, 1);
         s->yamaha = ports[i].base == 0x4c009800;
+        s->tg = ports[i].base == 0x4c008000 ||
+                ports[i].base == 0x4c008040;
         g_autofree char *name = g_strdup_printf("xg1000-fpga-uart%u", i + 1);
         Chardev *chr = serial_hd(i + 2);
 
