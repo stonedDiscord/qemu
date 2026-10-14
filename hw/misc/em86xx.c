@@ -53,6 +53,7 @@ struct EM86XXState {
     AudioBackend *audio_be;
     bool display_assist;
     QEMUTimer *display_timer;
+    QEMUTimer *video_timer;
     QemuConsole *console;
 };
 
@@ -352,6 +353,55 @@ static void em86xx_audio_tick(void *opaque)
         }
     }
     timer_mod(s->audio_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
+}
+
+/* Local video firmware stub for the supplied em8xxx ABI. The driver installs
+ * an IRQ task with pointers to the VTI mask/status words. The VTI command is
+ * two words before that mask. Complete control commands only; no compressed
+ * stream is consumed and no decoded pictures are fabricated.
+ */
+static void em86xx_video_tick(void *opaque)
+{
+    EM86XXState *s = opaque;
+
+    for (unsigned engine = 0; engine < 2; engine++) {
+        hwaddr head = 0x1000525c + engine * 8;
+        hwaddr task = em86xx_shared_read(head);
+        for (unsigned n = 0; n < 256 && task != head &&
+             em86xx_task_address(task); n++) {
+            uint32_t module = em86xx_shared_read(task + 0x28);
+            uint32_t flags = em86xx_shared_read(task + 0x2c);
+            hwaddr mask = em86xx_shared_read(task + 8);
+            hwaddr irq = em86xx_shared_read(task + 12);
+            if ((module & 0xff) == 0x1a && !(flags & 3) &&
+                mask >= 8 && em86xx_dram_range(mask - 8, 16) &&
+                irq == mask + 4 && em86xx_dram_range(irq, 4)) {
+                hwaddr command = mask - 8;
+                /* video_get_irq_info returns VTI+8/+12, so the command
+                 * is mask-8 and decoder state is mask-4. FF is idle. */
+                uint32_t cmd = em86xx_shared_read(command);
+                if (cmd <= 7 && cmd != 5 &&
+                    (em86xx_shared_read(mask) & 1)) {
+                    em86xx_shared_write(command + 4, cmd == 1 ? 2 : cmd);
+                    em86xx_shared_write(command, 0xff);
+                    em86xx_shared_write(irq, em86xx_shared_read(irq) | 1);
+                    /* Deliver the auxiliary engine's emhwlib callback first,
+                     * then its application event, through the existing IRQ. */
+                    em86xx_shared_write(task + 0x1c,
+                        em86xx_shared_read(task + 0x1c) | 1);
+                    em86xx_shared_write(task + 0x20,
+                        em86xx_shared_read(task + 0x20) | 1);
+                    em86xx_shared_write(task + 0x2c, flags | 0x23);
+                    em86xx_shared_write(0x617f8,
+                        em86xx_shared_read(0x617f8) | 0x10);
+                    em86xx_shared_write(0x6e010, 0x10);
+                }
+            }
+            task = em86xx_shared_read(task);
+        }
+    }
+    timer_mod(s->video_timer,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
 }
 
@@ -706,6 +756,10 @@ static void em86xx_reset(void *opaque)
         timer_mod(s->display_timer,
                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 16666667);
     }
+    if (s->video_timer) {
+        timer_mod(s->video_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
+    }
 }
 
 static void em86xx_realize(DeviceState *dev, Error **errp)
@@ -768,6 +822,8 @@ static void em86xx_realize(DeviceState *dev, Error **errp)
         qemu_console_resize(s->console, 1280, 720);
         s->display_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                         em86xx_display_tick, s);
+        s->video_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                      em86xx_video_tick, s);
     }
     qemu_register_reset(em86xx_reset, s);
 }
