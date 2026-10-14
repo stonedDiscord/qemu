@@ -1115,6 +1115,17 @@ meson.override_dependency('glib-2.0', glib)
 add_project_dependencies(glib.partial_dependency(compile_args: true, includes: true),
                          native: false, language: all_languages)
 
+# Optional host decoder for the local XG1000 firmware assist.
+xg_audio_deps = []
+if have_system
+  xg_avcodec = dependency('libavcodec', version: '>=59', required: false)
+  xg_avutil = dependency('libavutil', version: '>=57', required: false)
+  xg_swresample = dependency('libswresample', version: '>=4', required: false)
+  if xg_avcodec.found() and xg_avutil.found() and xg_swresample.found()
+    xg_audio_deps = [xg_avcodec, xg_avutil, xg_swresample]
+  endif
+endif
+
 gio = not_found
 gdbus_codegen = not_found
 gdbus_codegen_error = '@0@ requires gdbus-codegen, please install libgio'
@@ -2272,6 +2283,7 @@ endif
 #################
 
 config_host_data = configuration_data()
+config_host_data.set('CONFIG_XG1000_AUDIO_FFMPEG', xg_audio_deps.length() != 0)
 
 config_host_data.set('CONFIG_HMP', have_hmp)
 config_host_data.set('CONFIG_HAVE_RUST', have_rust)

@@ -9,6 +9,12 @@
 #include "qemu/bswap.h"
 #include "qapi/error.h"
 #include "system/reset.h"
+#include "qemu/audio.h"
+#include "hw/core/qdev-properties-system.h"
+#ifdef CONFIG_XG1000_AUDIO_FFMPEG
+#include <libavcodec/avcodec.h>
+#include <libswresample/swresample.h>
+#endif
 
 #define TYPE_EM86XX "em86xx"
 OBJECT_DECLARE_SIMPLE_TYPE(EM86XXState, EM86XX)
@@ -16,7 +22,18 @@ OBJECT_DECLARE_SIMPLE_TYPE(EM86XXState, EM86XX)
 typedef struct AudioSlot {
     EM86XXState *owner;
     unsigned offset;
-    bool status;
+    bool playing;
+    SWVoiceOut *voice;
+#ifdef CONFIG_XG1000_AUDIO_FFMPEG
+    AVCodecParserContext *parser;
+    AVCodecContext *decoder;
+    SwrContext *resampler;
+    int sample_rate;
+    enum AVSampleFormat sample_format;
+    AVChannelLayout layout;
+    uint8_t pcm[65536];
+    size_t pcm_pos, pcm_size;
+#endif
 } AudioSlot;
 
 struct EM86XXState {
@@ -27,8 +44,12 @@ struct EM86XXState {
     uint8_t regs[0x70000];
     uint32_t read_count;
     bool audio_stub;
-    MemoryRegion audio_commands[8];
-    AudioSlot audio_slots[8];
+    MemoryRegion audio_commands[4];
+    AudioSlot audio_slots[4];
+    QEMUTimer *audio_timer;
+    uint32_t audio_pending;
+    uint32_t audio_blocked;
+    AudioBackend *audio_be;
     bool display_assist;
     QEMUTimer *display_timer;
 };
@@ -47,6 +68,289 @@ static void em86xx_shared_write(hwaddr addr, uint32_t value)
 {
     address_space_stl_le(&address_space_memory, addr, value,
                          MEMTXATTRS_UNSPECIFIED, NULL);
+}
+
+static bool em86xx_task_address(hwaddr addr)
+{
+    return !(addr & 3) && addr >= 0x10000000 && addr < 0x18000000 - 0x60;
+}
+
+static void em86xx_audio_discard(AudioSlot *slot)
+{
+    slot->playing = false;
+    if (slot->voice) {
+        audio_be_set_active_out(slot->owner->audio_be, slot->voice, false);
+    }
+#ifdef CONFIG_XG1000_AUDIO_FFMPEG
+    av_parser_close(slot->parser);
+    slot->parser = NULL;
+    avcodec_free_context(&slot->decoder);
+    swr_free(&slot->resampler);
+    av_channel_layout_uninit(&slot->layout);
+    slot->pcm_pos = slot->pcm_size = 0;
+#endif
+}
+
+static void em86xx_audio_out(void *opaque, int available)
+{
+#ifdef CONFIG_XG1000_AUDIO_FFMPEG
+    AudioSlot *slot = opaque;
+    if (slot->playing && slot->pcm_pos < slot->pcm_size) {
+        slot->pcm_pos += audio_be_write(slot->owner->audio_be, slot->voice,
+            slot->pcm + slot->pcm_pos,
+            MIN((size_t)available, slot->pcm_size - slot->pcm_pos));
+    }
+#endif
+}
+
+static void em86xx_audio_decode(AudioSlot *slot)
+{
+#ifdef CONFIG_XG1000_AUDIO_FFMPEG
+    EM86XXState *s = slot->owner;
+    uint8_t *ram = memory_region_get_ram_ptr(&s->risc_ram);
+    hwaddr fifo = 0x100000 + slot->offset - 0x58 +
+                  ((slot - s->audio_slots) % 2 ? 4 : 0);
+    uint32_t base, size, rd, wr, count;
+    uint8_t input[4096 + AV_INPUT_BUFFER_PADDING_SIZE] = { 0 };
+    AVPacket *packet;
+    AVFrame *frame;
+    int consumed;
+
+    if (!slot->playing || slot->pcm_pos != slot->pcm_size ||
+        (s->audio_blocked & (1U << (slot - s->audio_slots))) ||
+        (ldl_le_p(ram + slot->offset + 16) & 0xff) != 2) {
+        return;
+    }
+    base = em86xx_shared_read(fifo);
+    size = em86xx_shared_read(fifo + 4);
+    rd = em86xx_shared_read(fifo + 8);
+    wr = em86xx_shared_read(fifo + 12);
+    /* FIFO indices are byte offsets, not guest pointers. Never follow a
+     * firmware-upload word or a malformed descriptor outside guest DRAM.
+     */
+    if (base < 0x10000000 || base >= 0x18000000 || !size ||
+        size > 0x18000000 - base || rd >= size || wr >= size || rd == wr) {
+        return;
+    }
+    count = MIN(sizeof(input) - AV_INPUT_BUFFER_PADDING_SIZE,
+                MIN(wr > rd ? wr - rd : size - rd, size - rd));
+    if (address_space_read(&address_space_memory, base + rd,
+                           MEMTXATTRS_UNSPECIFIED, input, count) != MEMTX_OK) {
+        return;
+    }
+    if (!slot->parser) {
+        slot->parser = av_parser_init(AV_CODEC_ID_MP3);
+        slot->decoder = avcodec_alloc_context3(NULL);
+        if (!slot->parser || !slot->decoder) {
+            em86xx_audio_discard(slot);
+            return;
+        }
+    }
+    packet = av_packet_alloc();
+    frame = av_frame_alloc();
+    if (!packet || !frame) {
+        av_packet_free(&packet);
+        av_frame_free(&frame);
+        return;
+    }
+    consumed = av_parser_parse2(slot->parser, slot->decoder,
+                               &packet->data, &packet->size, input, count,
+                               AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
+    if (consumed > 0) {
+        em86xx_shared_write(fifo + 8, (rd + consumed) % size);
+    }
+    if (packet->size >= 4) {
+        unsigned layer = (packet->data[1] >> 1) & 3;
+        enum AVCodecID id = layer == 3 ? AV_CODEC_ID_MP1 :
+                            layer == 2 ? AV_CODEC_ID_MP2 : AV_CODEC_ID_MP3;
+        if (!slot->decoder->codec || slot->decoder->codec_id != id) {
+            avcodec_free_context(&slot->decoder);
+            slot->decoder = avcodec_alloc_context3(avcodec_find_decoder(id));
+            if (!slot->decoder || avcodec_open2(slot->decoder,
+                    avcodec_find_decoder(id), NULL) < 0) {
+                em86xx_audio_discard(slot);
+                goto done;
+            }
+        }
+        if (avcodec_send_packet(slot->decoder, packet) < 0 ||
+            avcodec_receive_frame(slot->decoder, frame) < 0) {
+            goto done;
+        }
+        if (!slot->resampler || slot->sample_rate != frame->sample_rate ||
+            slot->sample_format != frame->format ||
+            av_channel_layout_compare(&slot->layout, &frame->ch_layout)) {
+            AVChannelLayout stereo = AV_CHANNEL_LAYOUT_STEREO;
+            swr_free(&slot->resampler);
+            av_channel_layout_uninit(&slot->layout);
+            av_channel_layout_copy(&slot->layout, &frame->ch_layout);
+            slot->sample_rate = frame->sample_rate;
+            slot->sample_format = frame->format;
+            if (swr_alloc_set_opts2(&slot->resampler, &stereo, AV_SAMPLE_FMT_S16,
+                    44100, &frame->ch_layout, frame->format,
+                    frame->sample_rate, 0, NULL) < 0 ||
+                swr_init(slot->resampler) < 0) {
+                swr_free(&slot->resampler);
+                goto done;
+            }
+        }
+        uint8_t *out = slot->pcm;
+        int samples = swr_convert(slot->resampler, &out, sizeof(slot->pcm) / 4,
+                                  (const uint8_t **)frame->extended_data,
+                                  frame->nb_samples);
+        if (samples > 0) {
+            slot->pcm_pos = 0;
+            slot->pcm_size = samples * 4;
+        }
+    }
+done:
+    av_frame_free(&frame);
+    /* Parser output aliases the input or the parser's own buffer. */
+    packet->data = NULL;
+    packet->size = 0;
+    av_packet_free(&packet);
+#endif
+}
+
+static bool em86xx_dram_range(hwaddr base, uint32_t size)
+{
+    return base >= 0x10000000 && base < 0x18000000 &&
+           size <= 0x18000000 - base;
+}
+
+/* WRITE_PTS_DMEM_32/16 tasks reserve the decoder FIFO's write pointer
+ * before queuing a 24-byte host buffer descriptor. Copy from the task's
+ * independent transfer cursor before letting the decoder see those bytes.
+ * Completion advances rd only; the driver owns the descriptor eraser.
+ */
+static void em86xx_audio_transfer(EM86XXState *s, hwaddr task)
+{
+    hwaddr fifo = em86xx_shared_read(task + 0x30);
+    uint32_t mode = em86xx_shared_read(task + 0x2c);
+    uint32_t queue = em86xx_shared_read(task + 0x44);
+    uint32_t qsize = em86xx_shared_read(task + 0x48);
+    uint32_t qrd = em86xx_shared_read(task + 0x50);
+    uint32_t qwr = em86xx_shared_read(task + 0x54);
+    unsigned i;
+
+    for (i = 0; i < ARRAY_SIZE(s->audio_slots); i++) {
+        hwaddr expected = 0x100000 + s->audio_slots[i].offset - 0x58 +
+                          (i % 2 ? 4 : 0);
+        if (fifo == expected) {
+            break;
+        }
+    }
+    if (i == ARRAY_SIZE(s->audio_slots)) {
+        return;
+    }
+    if (qrd != qwr) {
+        s->audio_blocked |= 1U << i;
+    }
+    if (mode > 1 ||
+        em86xx_shared_read(task + 0x1c) != 0 ||
+        !em86xx_dram_range(queue, qsize) || qsize < 24 ||
+        qrd >= qsize || qwr >= qsize) {
+        return;
+    }
+    /* Bound work per tick, including malformed descriptors. */
+    for (unsigned n = 0; n < 8 && qrd != qwr; n++) {
+        uint32_t bytes, source, base, size, cursor, offset;
+        uint8_t buffer[4096];
+        if (qsize - qrd < 24 ||
+            (qwr >= qrd ? qwr - qrd : qsize - qrd + qwr) < 24) {
+            break;
+        }
+        bytes = em86xx_shared_read(queue + qrd);
+        source = em86xx_shared_read(queue + qrd + 4);
+        base = em86xx_shared_read(fifo);
+        size = em86xx_shared_read(fifo + 4);
+        cursor = em86xx_shared_read(task + 0x40);
+        if (!em86xx_dram_range(source, bytes) ||
+            !em86xx_dram_range(base, size) || !size || bytes >= size ||
+            bytes > 1024 * 1024 ||
+            cursor < base || cursor >= (hwaddr)base + size) {
+            break;
+        }
+        offset = cursor - base;
+        for (uint32_t copied = 0; copied < bytes;) {
+            uint32_t count = MIN(sizeof(buffer), MIN(bytes - copied,
+                                                     size - offset));
+            if (address_space_read(&address_space_memory, source + copied,
+                MEMTXATTRS_UNSPECIFIED, buffer, count) != MEMTX_OK ||
+                address_space_write(&address_space_memory, base + offset,
+                MEMTXATTRS_UNSPECIFIED, buffer, count) != MEMTX_OK) {
+                return;
+            }
+            copied += count;
+            offset = (offset + count) % size;
+        }
+        em86xx_shared_write(task + 0x40, base + offset);
+        qrd = (qrd + 24) % qsize;
+        em86xx_shared_write(task + 0x50, qrd);
+        /* CPUBlock::ProcessInterrupt bit 1 walks the host transfer list
+         * and reclaims completed descriptors through SendBufferComplete.
+         */
+        em86xx_shared_write(0x617f8, em86xx_shared_read(0x617f8) | 2);
+        em86xx_shared_write(0x6e010, 2);
+    }
+    if (qrd == qwr) {
+        s->audio_blocked &= ~(1U << i);
+    }
+}
+
+static void em86xx_audio_tick(void *opaque)
+{
+    EM86XXState *s = opaque;
+    uint8_t *ram = memory_region_get_ram_ptr(&s->risc_ram);
+    s->audio_blocked = 0;
+
+    /* CPUBlock::FlushTransferTask waits for the auxiliary interrupt handler
+     * to quiesce a registered host/MBUS transfer before erasing its FIFO.
+     * Walk only installed tasks, with a bound for malformed guest lists.
+     */
+    for (unsigned i = 0; i < 2; i++) {
+        hwaddr head = 0x10005244 + i * 12;
+        hwaddr task = em86xx_shared_read(head);
+        for (unsigned n = 0; n < 256 && task != head &&
+             em86xx_task_address(task); n++) {
+            if (em86xx_shared_read(task + 0x18) == 1) {
+                em86xx_shared_write(task + 0x18, 2);
+            } else if (!i && !em86xx_shared_read(task + 0x18)) {
+                em86xx_audio_transfer(s, task);
+            }
+            task = em86xx_shared_read(task);
+        }
+    }
+
+    for (unsigned i = 0; i < ARRAY_SIZE(s->audio_slots); i++) {
+        em86xx_audio_decode(&s->audio_slots[i]);
+        if (!(s->audio_pending & (1U << i))) {
+            continue;
+        }
+        hwaddr head = 0x1000526c + (i / 2) * 8;
+        hwaddr task = em86xx_shared_read(head);
+        for (unsigned n = 0; n < 256 && task != head &&
+             em86xx_task_address(task); n++) {
+            unsigned offset = s->audio_slots[i].offset;
+            if (em86xx_shared_read(task + 0x28) ==
+                (0x1c + i * 0x100) &&
+                !(em86xx_shared_read(task + 0x2c) & 2)) {
+                stl_le_p(ram + offset + 4,
+                         ldl_le_p(ram + offset + 4) | 1);
+                em86xx_shared_write(task + 0x20,
+                                    em86xx_shared_read(task + 0x20) | 1);
+                em86xx_shared_write(task + 0x2c,
+                                    em86xx_shared_read(task + 0x2c) | 0x22);
+                em86xx_shared_write(0x617f8,
+                                    em86xx_shared_read(0x617f8) | 0x10);
+                em86xx_shared_write(0x6e010, 0x10);
+                s->audio_pending &= ~(1U << i);
+                break;
+            }
+            task = em86xx_shared_read(task);
+        }
+    }
+    timer_mod(s->audio_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
 }
 
 static void em86xx_display_tick(void *opaque)
@@ -83,12 +387,12 @@ static void em86xx_display_tick(void *opaque)
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 16666667);
 }
 
-/* Local silent stub for audio_set_command/audio_get_command in em8xxx.ko.
+/* Local firmware assist for audio_set_command/audio_get_command in em8xxx.ko.
  * Each engine has two command slots at PMEM + 0x10674/+0x1069c.
  * The driver writes the payload first and the command last; zero means
  * firmware has accepted the request. Keep payload/configuration in RAM.
- * Status words at command + 12 report stopped (1), allowing format
- * changes through change_State(). This acknowledges control only: it does not decode or render audio.
+ * Status words at command + 12 distinguish play (1), pause (2), stop (3)
+ * and uninitialized (7). MPEG bitstreams use an optional host decoder.
  */
 static uint64_t em86xx_audio_read(void *opaque, hwaddr addr, unsigned size)
 {
@@ -106,10 +410,34 @@ static void em86xx_audio_write(void *opaque, hwaddr addr, uint64_t value,
 {
     AudioSlot *slot = opaque;
     uint8_t *ram = memory_region_get_ram_ptr(&slot->owner->risc_ram);
-    if (!slot->status && !addr && size == 4 && value > 0 && value <= 7) {
+    if (!addr && size == 4 &&
+        (value == 1 || value == 2 || value == 3 || value == 6 || value == 7)) {
         /* Driver commands are 1..7. Firmware uploads remain normal RAM. */
         stl_le_p(ram + slot->offset, 0);
-        stl_le_p(ram + slot->offset + 12, 1);
+        if (value == 3 || value == 6 || value == 7) {
+            em86xx_audio_discard(slot);
+        }
+        if (value == 1) {
+            struct audsettings settings = {
+                .freq = 44100, .nchannels = 2, .fmt = AUDIO_FORMAT_S16,
+                .big_endian = HOST_BIG_ENDIAN,
+            };
+            slot->voice = audio_be_open_out(slot->owner->audio_be, slot->voice,
+                "xg1000-mpeg", slot, em86xx_audio_out, &settings);
+        }
+        slot->playing = value == 1;
+        if (slot->voice) {
+            audio_be_set_active_out(slot->owner->audio_be, slot->voice,
+                                     slot->playing);
+            if (value == 7) {
+                audio_be_close_out(slot->owner->audio_be, slot->voice);
+                slot->voice = NULL;
+            }
+        }
+        stl_le_p(ram + slot->offset + 12,
+                  value == 1 ? 1 : value == 2 ? 2 : value == 7 ? 7 : 3);
+        slot->owner->audio_pending |=
+            1U << (slot - slot->owner->audio_slots);
         return;
     }
     for (unsigned i = 0; i < size; i++) {
@@ -244,6 +572,19 @@ static void em86xx_reset(void *opaque)
     EM86XXState *s = opaque;
     memset(s->regs, 0, sizeof(s->regs));
     s->read_count = 0;
+    s->audio_pending = 0;
+    s->audio_blocked = 0;
+    for (unsigned i = 0; i < ARRAY_SIZE(s->audio_slots); i++) {
+        em86xx_audio_discard(&s->audio_slots[i]);
+        if (s->audio_slots[i].voice) {
+            audio_be_close_out(s->audio_be, s->audio_slots[i].voice);
+            s->audio_slots[i].voice = NULL;
+        }
+    }
+    if (s->audio_timer) {
+        timer_mod(s->audio_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
+    }
     if (s->display_timer) {
         timer_mod(s->display_timer,
                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 16666667);
@@ -287,15 +628,19 @@ static void em86xx_realize(DeviceState *dev, Error **errp)
     }
     sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->risc_ram);
     if (s->audio_stub) {
+        if (!audio_be_check(&s->audio_be, errp)) {
+            return;
+        }
+        s->audio_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                      em86xx_audio_tick, s);
         static const unsigned slots[] = { 0x90674, 0x9069c,
-                                          0xb0674, 0xb069c,
-                                          0x90680, 0x906a8,
-                                          0xb0680, 0xb06a8 };
+                                          0xb0674, 0xb069c };
         for (unsigned i = 0; i < ARRAY_SIZE(slots); i++) {
-            s->audio_slots[i] = (AudioSlot) { s, slots[i], i >= 4 };
+            s->audio_slots[i].owner = s;
+            s->audio_slots[i].offset = slots[i];
             memory_region_init_io(&s->audio_commands[i], OBJECT(s),
                                   &em86xx_audio_ops, &s->audio_slots[i],
-                                  "em86xx-silent-audio-command", 4);
+                                  "em86xx-audio-command", 4);
             memory_region_add_subregion(&s->risc_ram, slots[i],
                                         &s->audio_commands[i]);
         }
@@ -308,6 +653,7 @@ static void em86xx_realize(DeviceState *dev, Error **errp)
 }
 
 static const Property em86xx_properties[] = {
+    DEFINE_AUDIO_PROPERTIES(EM86XXState, audio_be),
     DEFINE_PROP_BOOL("xg1000-audio-stub", EM86XXState, audio_stub, false),
     DEFINE_PROP_BOOL("xg1000-display-assist", EM86XXState, display_assist, false),
 };
