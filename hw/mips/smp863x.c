@@ -181,9 +181,11 @@ static void xg1000_yamaha_tx(XG1000UART *s, uint8_t byte)
             unsigned reg = s->tx[7] + i;
             uint8_t value = reg == 1 ? 0x7f : 0;
 
-            /* Synthetic 0x2000 protected/download version. */
+            /* Synthetic 2.350 (0x2350) protected/download version. */
             if (reg == 2 || reg == 4) {
-                value = 0x20;
+                value = 0x23;
+            } else if (reg == 3 || reg == 5) {
+                value = 0x50;
             }
             xg1000_yamaha_reply(s, reg, value);
         }
