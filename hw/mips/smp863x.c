@@ -1140,6 +1140,16 @@ static void smp863x_init_common(MachineState *machine, bool front_panel_uart)
     qemu_register_reset(smp863x_cpu_reset, s);
 
     memory_region_add_subregion(sysmem, SMP863X_DRAM_BASE, machine->ram);
+    if (front_panel_uart) {
+        /* XG1000's media surfaces use DRAM1, independently of Linux's
+         * DRAM0 allocation.  MEMCFG already advertises this second bank;
+         * without backing RAM RUA's zone initialization disappears and
+         * every OSD surface allocation returns error 40. */
+        MemoryRegion *dram1 = g_new(MemoryRegion, 1);
+        memory_region_init_ram(dram1, NULL, "xg1000.dram1", 128 * MiB,
+                               &error_fatal);
+        memory_region_add_subregion_overlap(sysmem, 0x20000000, dram1, 3);
+    }
     /* Match the board's persistent zboot memory configuration.  Without a
      * valid record zboot falls back to a single 64 MiB DRAM bank. */
     {

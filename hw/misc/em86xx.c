@@ -10,6 +10,7 @@
 #include "qapi/error.h"
 #include "system/reset.h"
 #include "qemu/audio.h"
+#include "ui/console.h"
 #include "hw/core/qdev-properties-system.h"
 #ifdef CONFIG_XG1000_AUDIO_FFMPEG
 #include <libavcodec/avcodec.h>
@@ -52,6 +53,7 @@ struct EM86XXState {
     AudioBackend *audio_be;
     bool display_assist;
     QEMUTimer *display_timer;
+    QemuConsole *console;
 };
 
 /* Local XG1000 experiment for the supplied em8xxx.ko shared-memory ABI.
@@ -353,14 +355,124 @@ static void em86xx_audio_tick(void *opaque)
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
 }
 
+static bool em86xx_display_address(hwaddr addr, uint64_t size)
+{
+    return (addr >= 0x10000000 && addr + size <= 0x18000000) ||
+           (addr >= 0x20000000 && addr + size <= 0x28000000);
+}
+
+/* Local scanout of the surfaces attached by libdcc. The guest owns the
+ * surface and picture descriptors; read them afresh so freeing or rebinding
+ * a layer cannot leave host pointers into old guest allocations. */
+static bool em86xx_display_update(void *opaque)
+{
+    EM86XXState *s = opaque;
+    static const struct {
+        hwaddr info;
+        hwaddr control;
+    } layers[] = {
+        { 0x10002ce4, 0x10002d9c },
+        { 0x10002bf4, 0x10002c9c },
+        { 0x10002de4, 0x10002e2c },
+        { 0x10002e74, 0x10002eb4 },
+    };
+    DisplaySurface *out = qemu_console_surface(s->console);
+    uint32_t *dst = surface_data(out);
+    int stride = surface_stride(out) / 4;
+    const unsigned width = surface_width(out), height = surface_height(out);
+
+    memset(dst, 0, surface_stride(out) * height);
+    for (unsigned l = 0; l < ARRAY_SIZE(layers); l++) {
+        hwaddr surf = em86xx_shared_read(layers[l].info);
+        if (!em86xx_shared_read(layers[l].control + 8) ||
+            !em86xx_display_address(surf, 0x58)) {
+            continue;
+        }
+        hwaddr pic = em86xx_shared_read(surf + 12);
+        unsigned mode = em86xx_shared_read(surf + 0x24);
+        unsigned format = em86xx_shared_read(surf + 0x28);
+        unsigned colorspace = em86xx_shared_read(surf + 0x20);
+        if (!em86xx_display_address(pic, 0xf0)) {
+            continue;
+        }
+        unsigned w = em86xx_shared_read(pic + 0x18);
+        unsigned h = em86xx_shared_read(pic + 0x1c);
+        hwaddr pixels = em86xx_shared_read(pic);
+        unsigned bpp = mode == 4 ? 1 : 4;
+        if (!w || !h || w > 1920 || h > 4320 ||
+            (mode != 4 && !((mode == 5 || mode == 6) && format == 4)) ||
+            !em86xx_display_address(pixels, (uint64_t)w * h * bpp)) {
+            continue;
+        }
+        uint8_t *data = g_malloc((size_t)w * h * bpp);
+        if (address_space_read(&address_space_memory, pixels,
+                               MEMTXATTRS_UNSPECIFIED, data,
+                               (size_t)w * h * bpp) != MEMTX_OK) {
+            g_free(data);
+            continue;
+        }
+        uint32_t palette[256] = { 0 };
+        if (mode == 4) {
+            hwaddr pal = em86xx_shared_read(pic + 0xe0);
+            if (!em86xx_display_address(pal, sizeof(palette))) {
+                g_free(data);
+                continue;
+            }
+            for (unsigned i = 0; i < 256; i++) {
+                palette[i] = em86xx_shared_read(pal + i * 4);
+            }
+        }
+        for (unsigned y = 0; y < height; y++) {
+            for (unsigned x = 0; x < width; x++) {
+                size_t pos = ((uint64_t)y * h / height * w +
+                              (uint64_t)x * w / width) * bpp;
+                uint32_t p = mode == 4 ? palette[data[pos]] :
+                                        ldl_le_p(data + pos);
+                unsigned a = p >> 24;
+                int r = (p >> 16) & 255, g = (p >> 8) & 255, b = p & 255;
+                if (colorspace == 4 || colorspace == 5) {
+                    int yy = r - 16, u = b - 128, v = g - 128;
+                    r = (298 * yy + 409 * v + 128) >> 8;
+                    g = (298 * yy - 100 * u - 208 * v + 128) >> 8;
+                    b = (298 * yy + 516 * u + 128) >> 8;
+                }
+                uint32_t old = dst[y * stride + x];
+                r = (CLAMP(r, 0, 255) * a +
+                     ((old >> 16) & 255) * (255 - a)) / 255;
+                g = (CLAMP(g, 0, 255) * a +
+                     ((old >> 8) & 255) * (255 - a)) / 255;
+                b = (CLAMP(b, 0, 255) * a +
+                     (old & 255) * (255 - a)) / 255;
+                dst[y * stride + x] = (r << 16) | (g << 8) | b;
+            }
+        }
+        g_free(data);
+    }
+    qemu_console_update_full(s->console);
+    return true;
+}
+
+static const GraphicHwOps em86xx_graphic_ops = {
+    .gfx_update = em86xx_display_update,
+};
+
 static void em86xx_display_tick(void *opaque)
 {
     EM86XXState *s = opaque;
     const hwaddr task = 0x10003140;
     static const hwaddr blocks[] = {
         0x1000193c, /* digital output */
+        0x10001b0c, /* main analog / composite output */
         0x10001cd8, /* component output */
         0x10001e80, /* routing */
+        0x10002050, /* main mixer */
+        0x10002ab4, /* VCR multi-scaler */
+        0x10002c9c, /* graphics multi-scaler */
+        0x10002d9c, /* main video scaler */
+        0x10002e2c, /* OSD scaler */
+        0x10002eb4, /* subpicture scaler */
+        0x10002f30, /* video plane */
+        0x10002fb4, /* HD/SD converter */
     };
 
     /* Wait until the guest installs the display task. Preserve queued
@@ -370,14 +482,19 @@ static void em86xx_display_tick(void *opaque)
         em86xx_shared_read(task + 0x28) == 3 &&
         !(em86xx_shared_read(task + 0x2c) & 2)) {
         for (unsigned i = 0; i < ARRAY_SIZE(blocks); i++) {
+            /* Enable/disable writes do not necessarily set Validate's
+             * pending mask.  Active state must still follow the request
+             * at VSYNC, particularly before a surface can be freed. */
+            em86xx_shared_write(blocks[i] + 8,
+                                em86xx_shared_read(blocks[i] + 4));
             if (em86xx_shared_read(blocks[i])) {
-                em86xx_shared_write(blocks[i] + 8,
-                                    em86xx_shared_read(blocks[i] + 4));
                 em86xx_shared_write(blocks[i], 0);
             }
         }
+        /* SDK VSYNC bits for the outputs and blocks consumed above.
+         * Do not invent NEW_PICTURE or in-band command events. */
         em86xx_shared_write(task + 0x20,
-                            em86xx_shared_read(task + 0x20) | 7);
+                            em86xx_shared_read(task + 0x20) | 0x7de7);
         em86xx_shared_write(task + 0x2c,
                             em86xx_shared_read(task + 0x2c) | 0x22);
         em86xx_shared_write(0x617f8, em86xx_shared_read(0x617f8) | 0x10);
@@ -646,6 +763,9 @@ static void em86xx_realize(DeviceState *dev, Error **errp)
         }
     }
     if (s->display_assist) {
+        s->console = qemu_graphic_console_create(dev, 0,
+                                                &em86xx_graphic_ops, s);
+        qemu_console_resize(s->console, 1280, 720);
         s->display_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                         em86xx_display_tick, s);
     }
