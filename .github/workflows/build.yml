@@ -22,7 +22,7 @@ jobs:
           pacman -Su --noconfirm
           pacman -S --noconfirm base-devel mingw-w64-x86_64-toolchain git python ninja
           pacman -S --noconfirm mingw-w64-x86_64-glib2 mingw-w64-x86_64-pixman python-setuptools
-          pacman -S --noconfirm mingw-w64-x86_64-gtk3 mingw-w64-x86_64-SDL2 mingw-w64-x86_64-libslirp
+          pacman -S --noconfirm mingw-w64-x86_64-gtk3 mingw-w64-x86_64-SDL2
       - name: CI-Build
         run: |
           mkdir build
