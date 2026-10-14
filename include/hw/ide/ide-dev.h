@@ -66,6 +66,7 @@ struct IDEState {
     char drive_serial_str[21];
     char drive_model_str[41];
     bool win2k_install_hack;
+    bool xg1000_pio_only;
     uint64_t wwn;
     /* ide regs */
     uint8_t feature;
@@ -165,6 +166,7 @@ struct IDEDevice {
      */
     uint16_t rotation_rate;
     bool win2k_install_hack;
+    bool xg1000_pio_only;
 };
 
 typedef struct IDEDrive {

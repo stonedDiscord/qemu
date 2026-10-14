@@ -314,6 +314,13 @@ static void ide_atapi_identify(IDEState *s)
         put_le16(p + 111, s->wwn);
     }
 
+    IDEDevice *dev = s->unit ? s->bus->slave : s->bus->master;
+    if (dev->xg1000_pio_only) {
+        put_le16(p + 49, 1 << 9);
+        put_le16(p + 62, 0);
+        put_le16(p + 63, 0);
+        put_le16(p + 88, 0);
+    }
     s->identify_set = 1;
 
 fill_buffer:

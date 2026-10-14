@@ -30,6 +30,7 @@
 #include "ide-internal.h"
 
 static const Property ide_props[] = {
+    DEFINE_PROP_BOOL("xg1000-pio-only", IDEDevice, xg1000_pio_only, false),
     DEFINE_PROP_UINT32("unit", IDEDevice, unit, -1),
     DEFINE_PROP_BOOL("win2k-install-hack", IDEDevice, win2k_install_hack, false),
 };
