@@ -689,6 +689,31 @@ static void smp863x_pci_set_irq(void *opaque, int irq, int level)
     smp863x_update_irq(s);
 }
 
+/*
+ * Local LCD transfer handshake only; pixel storage and scanout are absent.
+ * libGooSystem's CScreen::Clear/PutBox writes a row and starts the transfer
+ * at 0x4c00b80a, then waits for bit 0 at 0x4c00b80c. With no asynchronous
+ * consumer modeled, accept the row immediately. Keep this status read-only
+ * and leave the neighboring control/data registers in their existing RAM.
+ */
+static uint64_t xg1000_lcd_status_read(void *opaque, hwaddr addr, unsigned size)
+{
+    return addr == 0 ? 1 : 0;
+}
+
+static void xg1000_lcd_status_write(void *opaque, hwaddr addr,
+                                    uint64_t value, unsigned size)
+{
+}
+
+static const MemoryRegionOps xg1000_lcd_status_ops = {
+    .read = xg1000_lcd_status_read,
+    .write = xg1000_lcd_status_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 2 },
+    .impl = { .min_access_size = 1, .max_access_size = 2 },
+};
+
 static void smp863x_timer_cb(void *opaque)
 {
     SMP863XState *s = opaque;
@@ -1441,6 +1466,11 @@ static void smp863x_init_common(MachineState *machine, bool front_panel_uart)
                                0x1000, &error_fatal);
         memory_region_add_subregion_overlap(sysmem, 0x4c00b000ULL,
                                             lcd_regs, 3);
+        MemoryRegion *lcd_status = g_new(MemoryRegion, 1);
+        memory_region_init_io(lcd_status, NULL, &xg1000_lcd_status_ops, NULL,
+                              "xg1000-lcd-transfer-status", 2);
+        memory_region_add_subregion_overlap(sysmem, 0x4c00b80cULL,
+                                            lcd_status, 4);
     }
     if (s->flash_boot) {
         MemoryRegion *boot_alias = g_new(MemoryRegion, 1);
