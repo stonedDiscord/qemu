@@ -28,4 +28,4 @@ jobs:
           mkdir build
           cd build
           ../configure
-          make -j$ (nproc)
+          make -j2
