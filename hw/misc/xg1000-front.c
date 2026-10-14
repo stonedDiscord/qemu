@@ -9,6 +9,7 @@ struct XG1000Front {
     MemoryRegion uart;
     MemoryRegion irq_mask;
     MemoryRegion midi_timer;
+    MemoryRegion fan_counter;
     uint16_t midi_control;
     bool midi_pending;
     QEMUTimer *timer;
@@ -198,6 +199,31 @@ static const MemoryRegionOps xg1000_midi_timer_ops = {
     .valid = { .min_access_size = 2, .max_access_size = 2 },
 };
 
+/* FRONT_ioctl(16) reads the free-running 16-bit tachometer at 0x4c011000.
+ * FRONT_GetFanRpm measures its delta over one second and assumes two pulses per
+ * revolution. Use a synthetic constant 3000 RPM (100 pulses/second), tied
+ * to virtual time rather than MMIO read frequency. No fan mechanics or
+ * speed control are modeled. */
+static uint64_t xg1000_fan_read(void *opaque, hwaddr addr, unsigned size)
+{
+    uint16_t count = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 10000000;
+
+    return count >> (addr * 8);
+}
+
+static void xg1000_fan_write(void *opaque, hwaddr addr,
+                              uint64_t value, unsigned size)
+{
+}
+
+static const MemoryRegionOps xg1000_fan_ops = {
+    .read = xg1000_fan_read,
+    .write = xg1000_fan_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 2 },
+    .impl = { .min_access_size = 1, .max_access_size = 2 },
+};
+
 static void xg1000_front_reset(void *opaque)
 {
     XG1000Front *s = opaque;
@@ -220,6 +246,10 @@ void xg1000_front_init(XG1000Front *s, MemoryRegion *sysmem, qemu_irq irq)
 {
     s->irq = irq;
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, xg1000_front_tick, s);
+    memory_region_init_io(&s->fan_counter, NULL, &xg1000_fan_ops, s,
+                          "xg1000-fan-counter", 2);
+    memory_region_add_subregion_overlap(sysmem, 0x4c011000,
+                                        &s->fan_counter, 3);
     memory_region_init_io(&s->midi_timer, NULL, &xg1000_midi_timer_ops, s,
                           "xg1000-midi-timer", 0x10);
     memory_region_add_subregion_overlap(sysmem, 0x4c00e800,
