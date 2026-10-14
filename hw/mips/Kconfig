@@ -88,6 +88,7 @@ config FW_CFG_MIPS
     bool
 
 config SMP863X
+    select IDE_MMIO
     bool
     default y
     select PFLASH_CFI02

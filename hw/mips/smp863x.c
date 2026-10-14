@@ -36,6 +36,7 @@
 #include "system/block-backend-io.h"
 #include "target/mips/cpu.h"
 #include "hw/misc/xg1000-front.h"
+#include "net/net.h"
 
 #define SMP863X_DRAM_BASE       0x10000000ULL
 #define SMP863X_KERNEL_OFFSET   0x00020000ULL
@@ -63,6 +64,8 @@
 #define CPU_IRQ_ENABLE_SET      0x6e008
 #define CPU_IRQ_ENABLE_CLR      0x6e00c
 #define CPU_IRQ_RAWSTAT         0x6e004
+#define CPU_IRQ_SOFTSET         0x6e010
+#define CPU_IRQ_SOFTCLR         0x6e014
 #define CPU_EDGE_RAWSTAT        0x6e204  /* write-1-to-clear; kernel acks IRQs here */
 #define CPU_TIMER0_CTRL         0x6c508
 #define CPU_TIMER0_LOAD         0x6c500
@@ -114,8 +117,9 @@ typedef struct SMP863XState {
     uint32_t xenv_location;
     uint32_t reset_pc;
     qemu_irq cpu_irq;
-    uint32_t irq_enable;
-    uint32_t irq_status;
+    uint64_t irq_enable;
+    uint64_t irq_status;
+    uint64_t device_irq_levels;
     uint32_t xtal_counter;
     uint32_t regs[0x100000 / 4];
     QEMUTimer *timer;
@@ -129,7 +133,7 @@ typedef struct SMP863XState {
     XG1000Front *front;
 } SMP863XState;
 
-/* uart.ko uses a 16-bit FPGA FIFO interface, not a 16550 register bank. */
+/* uart.ko and midi_mod.ko use 16-bit FPGA FIFOs, not 16550 banks. */
 typedef struct XG1000UART {
     MemoryRegion mmio;
     CharFrontend chr;
@@ -164,19 +168,35 @@ static const MemoryRegionOps xg1000_uart_ops = {
 
 static void xg1000_uart_init(MemoryRegion *sysmem)
 {
-    static const hwaddr bases[] = { 0x4c009000, 0x4c010800, 0x4c012800 };
+    static const struct {
+        hwaddr base;
+        hwaddr size;
+    } ports[] = {
+        { 0x4c009000, 0x800 },
+        { 0x4c010800, 0x800 },
+        { 0x4c012800, 0x800 },
+        /* midi_mod.ko PortMap contains word offsets 0x4000, 0x4010,
+         * 0x4020, 0x4030 and 0x4c00 relative to FPGA base 0x4c000000.
+         * Overlay the flash alias so RX counts do not read ROM bytes.
+         */
+        { 0x4c008000, 0x20 },
+        { 0x4c008020, 0x20 },
+        { 0x4c008040, 0x20 },
+        { 0x4c008060, 0x20 },
+        { 0x4c009800, 0x20 },
+    };
 
-    for (unsigned i = 0; i < ARRAY_SIZE(bases); i++) {
+    for (unsigned i = 0; i < ARRAY_SIZE(ports); i++) {
         XG1000UART *s = g_new0(XG1000UART, 1);
         g_autofree char *name = g_strdup_printf("xg1000-fpga-uart%u", i + 1);
         Chardev *chr = serial_hd(i + 2);
 
         if (!chr) {
-            chr = qemu_chr_new(name, "vc:80Cx24C", NULL);
+            chr = qemu_chr_new(name, i < 3 ? "vc:80Cx24C" : "null", NULL);
         }
         qemu_chr_fe_init(&s->chr, chr, &error_fatal);
-        memory_region_init_io(&s->mmio, NULL, &xg1000_uart_ops, s, name, 0x800);
-        memory_region_add_subregion_overlap(sysmem, bases[i], &s->mmio, 3);
+        memory_region_init_io(&s->mmio, NULL, &xg1000_uart_ops, s, name, ports[i].size);
+        memory_region_add_subregion_overlap(sysmem, ports[i].base, &s->mmio, 3);
     }
 }
 
@@ -478,6 +498,13 @@ static const uint8_t smp863x_xenv[] = {
 
 static void smp863x_update_irq(SMP863XState *s)
 {
+    /* Software IRQ is level-sensitive until its pending sources are cleared. */
+    if (s->regs[CPU_IRQ_SOFTSET / 4]) {
+        s->irq_status |= 1U;
+    } else {
+        s->irq_status &= ~UINT64_C(1);
+    }
+    s->irq_status |= s->device_irq_levels;
     qemu_set_irq(s->cpu_irq, (s->irq_status & s->irq_enable) != 0);
 }
 
@@ -488,7 +515,7 @@ static void smp863x_front_irq(void *opaque, int n, int level)
     if (level) {
         s->irq_status |= 1U << 15;
     } else {
-        s->irq_status &= ~(1U << 15);
+        s->irq_status &= ~(UINT64_C(1) << 15);
     }
     smp863x_update_irq(s);
 }
@@ -512,7 +539,7 @@ static void smp863x_pci_set_irq(void *opaque, int irq, int level)
     if (level) {
         s->irq_status |= bit;
     } else {
-        s->irq_status &= ~bit;
+        s->irq_status &= ~(uint64_t)bit;
     }
     smp863x_update_irq(s);
 }
@@ -533,6 +560,20 @@ static void smp863x_timer_cb(void *opaque)
     timer_mod_ns(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + ns);
 }
 
+static void smp863x_device_irq(void *opaque, int irq, int level)
+{
+    SMP863XState *s = opaque;
+    uint64_t bit = UINT64_C(1) << irq;
+    if (level) {
+        s->device_irq_levels |= bit;
+        s->irq_status |= bit;
+    } else {
+        s->device_irq_levels &= ~bit;
+        s->irq_status &= ~bit;
+    }
+    smp863x_update_irq(s);
+}
+
 static void smp863x_uart_irq(void *opaque, int irq, int level)
 {
     SMP863XState *s = opaque;
@@ -541,7 +582,7 @@ static void smp863x_uart_irq(void *opaque, int irq, int level)
     if (level) {
         s->irq_status |= bit;
     } else {
-        s->irq_status &= ~bit;
+        s->irq_status &= ~(uint64_t)bit;
     }
     smp863x_update_irq(s);
 }
@@ -621,6 +662,12 @@ static uint32_t smp863x_regs_read32(SMP863XState *s, hwaddr addr)
         return 0x20;
     case 0x6c204: /* Front-panel LED UART data register. */
         return s->led_uart_data;
+    case 0x6e018:
+    case 0x6e01c:
+    case 0x6e224:
+        return s->irq_status >> 32;
+    case 0x6e020:
+        return s->irq_enable >> 32;
     case CPU_IRQ_STATUS:
     case CPU_IRQ_RAWSTAT:
         return s->irq_status;
@@ -812,8 +859,29 @@ static void smp863x_regs_write(void *opaque, hwaddr addr, uint64_t data,
     case 0x27000: /* Ethernet DMA reset completes immediately. */
         s->regs[addr / 4] = value & ~1U;
         return;
+    case 0x6e020:
+        s->irq_enable |= (uint64_t)write_bits << 32;
+        smp863x_update_irq(s);
+        return;
+    case 0x6e024:
+        s->irq_enable &= ~((uint64_t)write_bits << 32);
+        smp863x_update_irq(s);
+        return;
+    case 0x6e01c:
+    case 0x6e224:
+        s->irq_status &= ~((uint64_t)write_bits << 32);
+        smp863x_update_irq(s);
+        return;
     case CPU_IRQ_ENABLE_SET:
         s->irq_enable |= value;
+        smp863x_update_irq(s);
+        return;
+    case CPU_IRQ_SOFTSET:
+        s->regs[CPU_IRQ_SOFTSET / 4] |= write_bits;
+        smp863x_update_irq(s);
+        return;
+    case CPU_IRQ_SOFTCLR:
+        s->regs[CPU_IRQ_SOFTSET / 4] &= ~write_bits;
         smp863x_update_irq(s);
         return;
     case CPU_IRQ_ENABLE_CLR:
@@ -821,12 +889,12 @@ static void smp863x_regs_write(void *opaque, hwaddr addr, uint64_t data,
         smp863x_update_irq(s);
         return;
     case CPU_IRQ_RAWSTAT:
-        s->irq_status &= ~value;
+        s->irq_status &= ~(uint64_t)(uint32_t)value;
         smp863x_update_irq(s);
         return;
     case CPU_EDGE_RAWSTAT:
         /* kernel writes 1<<bit here to ack edge-triggered IRQs */
-        s->irq_status &= ~value;
+        s->irq_status &= ~(uint64_t)(uint32_t)value;
         smp863x_update_irq(s);
         return;
     case CPU_TIMER0_CTRL:
@@ -844,7 +912,7 @@ static void smp863x_regs_write(void *opaque, hwaddr addr, uint64_t data,
         s->timer_load = value & 0xffff;
         return;
     case CPU_TIMER0_CLR:
-        s->irq_status &= ~(1U << 5);
+        s->irq_status &= ~(UINT64_C(1) << 5);
         smp863x_update_irq(s);
         return;
     case CPU_REMAP:
@@ -921,24 +989,6 @@ static void smp863x_irqhandler_write(void *opaque, hwaddr addr, uint64_t data,
 static const MemoryRegionOps smp863x_irqhandler_ops = {
     .read = smp863x_irqhandler_read,
     .write = smp863x_irqhandler_write,
-    .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid = { .min_access_size = 1, .max_access_size = 4 },
-};
-
-static uint64_t smp863x_media_read(void *opaque, hwaddr addr, unsigned size)
-{
-    return smp863x_regs_read(opaque, addr + 0x70000, size);
-}
-
-static void smp863x_media_write(void *opaque, hwaddr addr, uint64_t data,
-                                  unsigned size)
-{
-    smp863x_regs_write(opaque, addr + 0x70000, data, size);
-}
-
-static const MemoryRegionOps smp863x_media_ops = {
-    .read = smp863x_media_read,
-    .write = smp863x_media_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid = { .min_access_size = 1, .max_access_size = 4 },
 };
@@ -1224,6 +1274,18 @@ static void smp863x_init_common(MachineState *machine, bool front_panel_uart)
         memory_region_init_io(pflash_cs3, NULL, &smp863x_flash_window_ops, s,
                               "smp863x-pflash-cs3", 0x04000000ULL);
         memory_region_add_subregion(sysmem, 0x4c000000ULL, pflash_cs3);
+
+        /*
+         * lcd_mod.ko maps 0x4c00b000 (the LCD controller register window)
+         * directly into userspace.  CS3 is otherwise a flash read stub;
+         * give the LCD window private storage so decoder initialisation can
+         * probe and program it without aliasing NOR contents.
+         */
+        MemoryRegion *lcd_regs = g_new(MemoryRegion, 1);
+        memory_region_init_ram(lcd_regs, NULL, "xg1000-lcd-stub",
+                               0x1000, &error_fatal);
+        memory_region_add_subregion_overlap(sysmem, 0x4c00b000ULL,
+                                            lcd_regs, 3);
     }
     if (s->flash_boot) {
         MemoryRegion *boot_alias = g_new(MemoryRegion, 1);
@@ -1297,17 +1359,11 @@ static void smp863x_init_common(MachineState *machine, bool front_panel_uart)
     memory_region_add_subregion(sysmem, 0x10000, regs);
     memory_region_add_subregion(sysmem, SMP863X_REG_BASE, cpuregs);
     {
-        MemoryRegion *media = g_new(MemoryRegion, 1);
-        MemoryRegion *risc_ram = g_new(MemoryRegion, 1);
+        DeviceState *media = qdev_new("em86xx");
 
-        /* Display and six media-engine register blocks. */
-        memory_region_init_io(media, NULL, &smp863x_media_ops, s,
-                              "smp863x-media-registers", 0x70000);
-        memory_region_add_subregion(sysmem, 0x70000, media);
-        /* Six RISC program/data RAM pairs, each 128 KiB. */
-        memory_region_init_ram(risc_ram, NULL, "smp863x-media-risc-ram",
-                               0xc0000, &error_fatal);
-        memory_region_add_subregion(sysmem, 0x100000, risc_ram);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(media), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(media), 0, 0x70000);
+        sysbus_mmio_map(SYS_BUS_DEVICE(media), 1, 0x100000);
     }
     {
         MemoryRegion *irqhandler = g_new(MemoryRegion, 1);
@@ -1337,9 +1393,29 @@ static void smp863x_init_common(MachineState *machine, bool front_panel_uart)
                                             4);
     }
 
-    /* XG1000 has no separate PB/MMIO IDE device.  Its only external storage
-     * controller is the PCI SiI3112 below; IF_IDE backends are consumed there
-     * so -drive if=ide can describe the board's SATA disks (or DVD image). */
+    /* Independent on-chip PIO IDE channel for the optical drive. */
+    {
+        DeviceState *ide = qdev_new(TYPE_MMIO_IDE);
+        DeviceState *cd = qdev_new("ide-cd");
+        qdev_prop_set_bit(cd, "xg1000-pio-only", true);
+        qdev_prop_set_uint32(ide, "shift", 2);
+        sysbus_connect_irq(SYS_BUS_DEVICE(ide), 0,
+                           qemu_allocate_irq(smp863x_device_irq, s, 18));
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(ide), &error_fatal);
+        sysbus_mmio_map_overlap(SYS_BUS_DEVICE(ide), 0, IDE_CMD_BLOCK, 1);
+        sysbus_mmio_map_overlap(SYS_BUS_DEVICE(ide), 1, IDE_CTRL_BLOCK, 1);
+        qdev_realize_and_unref(cd, qdev_get_child_bus(ide, "ide.0"),
+                               &error_fatal);
+    }
+    {
+        DeviceState *enet = qdev_new("tangox-enet");
+        qemu_configure_nic_device(enet, true, NULL);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(enet), &error_fatal);
+        sysbus_mmio_map_overlap(SYS_BUS_DEVICE(enet), 0,
+                               TANGOX_ENET_MAC_BASE, 1);
+        sysbus_connect_irq(SYS_BUS_DEVICE(enet), 0,
+                           qemu_allocate_irq(smp863x_device_irq, s, 38));
+    }
     /* Tangox exposes a conventional PCI root bus through fixed physical
      * windows.  The config window is directly encoded as bus/devfn/offset;
      * PCI BARs are mapped into the corresponding I/O and memory windows. */
