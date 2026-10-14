@@ -12,6 +12,7 @@
 #include "hw/char/serial-mm.h"
 #include "hw/usb/hcd-ohci.h"
 #include "hw/usb/hcd-ehci.h"
+#include "hw/usb/usb.h"
 #include "hw/block/flash.h"
 #include "hw/nvram/eeprom_at24c.h"
 #include "hw/ide/mmio.h"
@@ -1401,6 +1402,11 @@ static void smp863x_init_common(MachineState *machine, bool front_panel_uart)
         memory_region_add_subregion_overlap(sysmem, TANGOX_USB_OHCI_BASE,
                                             sysbus_mmio_get_region(ohci_bus, 0),
                                             4);
+        if (front_panel_uart) {
+            USBBus *bus = USB_BUS(QLIST_FIRST(&ohci->child_bus));
+
+            usb_create_simple(bus, "usb-yamaha-ses");
+        }
     }
 
     /* Independent on-chip PIO IDE channel for the optical drive. */

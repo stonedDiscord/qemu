@@ -92,4 +92,6 @@ endif
 
 system_ss.add(when: ['CONFIG_USB', 'CONFIG_XEN_BUS', libusb], if_true: files('xen-usb.c'))
 
+system_ss.add(when: 'CONFIG_SMP863X', if_true: files('dev-yamaha-ses.c'))
+
 modules += { 'hw-usb': hw_usb_modules }
