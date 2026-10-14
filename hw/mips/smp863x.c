@@ -1456,6 +1456,11 @@ static void smp863x_init_common(MachineState *machine, bool front_panel_uart)
     pci_bus_map_irqs(s->pci_bus, smp863x_pci_map_irq);
     pci_bus_irqs(s->pci_bus, smp863x_pci_set_irq, s, 4);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(pci_host), &error_fatal);
+    if (front_panel_uart) {
+        PCIDevice *codec = pci_create_simple(s->pci_bus, PCI_DEVFN(2, 0),
+                                            "vw2010");
+        codec->config[PCI_INTERRUPT_LINE] = 22;
+    }
     /* The XG1000 board carries a four-port Silicon Image 3114 at IDSEL 4. */
     {
         PCIDevice *sata = pci_create_simple(s->pci_bus, PCI_DEVFN(4, 0),

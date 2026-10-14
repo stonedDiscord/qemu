@@ -182,3 +182,4 @@ system_ss.add(files('xg1000-front.c'))
 system_ss.add(files('em86xx.c'), xg_audio_deps)
 
 system_ss.add(files('tangox-enet.c'))
+system_ss.add(when: 'CONFIG_SMP863X', if_true: files('vw2010.c'))
