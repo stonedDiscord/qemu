@@ -5,6 +5,22 @@
 #include "migration/vmstate.h"
 #include "desc.h"
 
+typedef struct YamahaSES {
+    USBDevice parent_obj;
+    uint8_t tx[0x10000];
+    unsigned tx_count, tx_expected, tx_finished;
+    uint8_t rx[8];
+    unsigned rx_count, rx_offset;
+} YamahaSES;
+
+static void ses_reset(USBDevice *dev)
+{
+    YamahaSES *s = (YamahaSES *)dev;
+
+    s->tx_count = s->tx_expected = s->tx_finished = 0;
+    s->rx_count = s->rx_offset = 0;
+}
+
 static const USBDescStrings ses_strings = {
     [1] = "YAMAHA Corporation",
     [2] = "YAMAHA SES Board",
@@ -53,19 +69,47 @@ static void ses_realize(USBDevice *dev, Error **errp)
 static void ses_control(USBDevice *dev, USBPacket *p, int request,
                         int value, int index, int length, uint8_t *data)
 {
+    YamahaSES *s = (YamahaSES *)dev;
+
     if (usb_desc_handle_control(dev, p, request, value, index, length,
                                 data) >= 0) {
         return;
     }
 
-    /* sesSetSetup uses vendor/endpoint IN requests with a two-byte
-     * little-endian word count. Requests 0/2 reserve send/receive space;
-     * 1/3 finish transfers. There is no DSP backend yet: advertise zero
-     * send capacity and no received data, rather than accept lost writes.
-     * The guest retries empty RECV_START at its configured interval. */
+    /* sesSetSetup counts four-byte words in little endian. SEMP headers
+     * and payloads use big endian. Only connect/disconnect are modeled. */
     if (request >= 0xc200 && request <= 0xc203 && index == 0 && length == 2) {
-        data[0] = 0;
-        data[1] = 0;
+        unsigned words = 0;
+
+        if (request == 0xc200 && !s->rx_count && value > 0 && value <= 0x3fff) {
+            s->tx_count = 0;
+            s->tx_finished = 0;
+            s->tx_expected = value * 4;
+            words = value;
+        } else if (request == 0xc201) {
+            if (s->tx_expected && s->tx_count == s->tx_expected) {
+                s->tx_finished = s->tx_count / 4;
+            }
+            words = s->tx_finished;
+            if (s->tx_count == s->tx_expected && s->tx_count == 4 &&
+                s->tx[0] == 0 && (s->tx[1] == 1 || s->tx[1] == 2) &&
+                s->tx[2] == 0 && s->tx[3] == 0) {
+                memset(s->rx, 0, sizeof(s->rx));
+                s->rx[0] = 0x80; /* response */
+                s->rx[1] = s->tx[1];
+                s->rx[3] = 1; /* one word: success status */
+                s->rx_count = sizeof(s->rx);
+                s->rx_offset = 0;
+            }
+            s->tx_count = s->tx_expected = 0;
+        } else if (request == 0xc202) {
+            words = s->rx_count / 4;
+            s->rx_offset = 0;
+        } else if (request == 0xc203 && s->rx_offset == s->rx_count) {
+            s->rx_count = s->rx_offset = 0;
+        }
+        data[0] = words;
+        data[1] = words >> 8;
         p->actual_length = 2;
         return;
     }
@@ -74,6 +118,23 @@ static void ses_control(USBDevice *dev, USBPacket *p, int request,
 
 static void ses_data(USBDevice *dev, USBPacket *p)
 {
+    YamahaSES *s = (YamahaSES *)dev;
+    unsigned count;
+
+    if (p->pid == USB_TOKEN_OUT && p->ep->nr == 2 && s->tx_expected &&
+        p->iov.size <= s->tx_expected - s->tx_count) {
+        count = p->iov.size;
+        usb_packet_copy(p, s->tx + s->tx_count, count);
+        s->tx_count += count;
+        return;
+    }
+    if (p->pid == USB_TOKEN_IN && p->ep->nr == 1 &&
+        s->rx_offset < s->rx_count) {
+        count = MIN(p->iov.size, s->rx_count - s->rx_offset);
+        usb_packet_copy(p, s->rx + s->rx_offset, count);
+        s->rx_offset += count;
+        return;
+    }
     p->status = USB_RET_NAK;
 }
 
@@ -89,6 +150,7 @@ static void ses_class_init(ObjectClass *klass, const void *data)
     uc->product_desc = "Yamaha SES USB transport";
     uc->usb_desc = &ses_desc;
     uc->realize = ses_realize;
+    uc->handle_reset = ses_reset;
     uc->handle_control = ses_control;
     uc->handle_data = ses_data;
     DEVICE_CLASS(klass)->vmsd = &ses_vmstate;
@@ -97,7 +159,7 @@ static void ses_class_init(ObjectClass *klass, const void *data)
 static const TypeInfo ses_type = {
     .name = "usb-yamaha-ses",
     .parent = TYPE_USB_DEVICE,
-    .instance_size = sizeof(USBDevice),
+    .instance_size = sizeof(YamahaSES),
     .class_init = ses_class_init,
 };
 

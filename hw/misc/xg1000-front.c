@@ -8,6 +8,9 @@
 struct XG1000Front {
     MemoryRegion uart;
     MemoryRegion irq_mask;
+    MemoryRegion midi_timer;
+    uint16_t midi_control;
+    bool midi_pending;
     QEMUTimer *timer;
     uint32_t regs[0x100 / 4];
     uint16_t mask;
@@ -85,7 +88,8 @@ static void xg1000_front_tick(void *opaque)
 {
     XG1000Front *s = opaque;
 
-    if (s->mask & 0xe00) {
+    if (s->mask & 0xf00) {
+        s->midi_pending = (s->midi_control & 1) != 0;
         qemu_set_irq(s->irq, 1);
         timer_mod_ns(s->timer,
                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
@@ -150,7 +154,7 @@ static void xg1000_front_mask_write(void *opaque, hwaddr addr,
     uint16_t mask = (size == 2 ? 0xffff : 0xff) << shift;
 
     s->mask = (s->mask & ~mask) | ((value << shift) & mask);
-    if (s->mask & 0xe00) {
+    if (s->mask & 0xf00) {
         timer_mod_ns(s->timer,
                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
     } else {
@@ -166,12 +170,42 @@ static const MemoryRegionOps xg1000_front_mask_ops = {
     .valid = { .min_access_size = 1, .max_access_size = 2 },
 };
 
+/* midi_mod.ko shares FPGA IRQ 23 with the front panel. It polls timer
+ * status bit 0, then acknowledges it with a write to offset 8. */
+static uint64_t xg1000_midi_timer_read(void *opaque, hwaddr addr, unsigned size)
+{
+    XG1000Front *s = opaque;
+
+    return addr == 8 ? s->midi_pending : addr == 0 ? s->midi_control : 0;
+}
+
+static void xg1000_midi_timer_write(void *opaque, hwaddr addr,
+                                  uint64_t value, unsigned size)
+{
+    XG1000Front *s = opaque;
+
+    if (addr == 0) {
+        s->midi_control = value;
+    } else if (addr == 8) {
+        s->midi_pending = false;
+    }
+}
+
+static const MemoryRegionOps xg1000_midi_timer_ops = {
+    .read = xg1000_midi_timer_read,
+    .write = xg1000_midi_timer_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 2, .max_access_size = 2 },
+};
+
 static void xg1000_front_reset(void *opaque)
 {
     XG1000Front *s = opaque;
 
     timer_del(s->timer);
     s->mask = 0;
+    s->midi_control = 0;
+    s->midi_pending = false;
     s->rx_head = s->rx_count = 0;
     s->command_pending = false;
     memset(s->regs, 0, sizeof(s->regs));
@@ -186,6 +220,10 @@ void xg1000_front_init(XG1000Front *s, MemoryRegion *sysmem, qemu_irq irq)
 {
     s->irq = irq;
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, xg1000_front_tick, s);
+    memory_region_init_io(&s->midi_timer, NULL, &xg1000_midi_timer_ops, s,
+                          "xg1000-midi-timer", 0x10);
+    memory_region_add_subregion_overlap(sysmem, 0x4c00e800,
+                                        &s->midi_timer, 3);
     memory_region_init_io(&s->uart, NULL, &xg1000_front_ops, s,
                           "xg1000-front-uart", 0x100);
     memory_region_init_io(&s->irq_mask, NULL, &xg1000_front_mask_ops, s,

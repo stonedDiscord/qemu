@@ -139,11 +139,83 @@ typedef struct XG1000UART {
     MemoryRegion mmio;
     CharFrontend chr;
     uint16_t baud;
+    bool yamaha;
+    uint8_t rx[512], tx[256];
+    unsigned rx_head, rx_count, tx_count;
+    int64_t next_power_status;
 } XG1000UART;
+
+/* Local initialization-only Yamaha DSP model, inferred from
+ * libymhAudioDriver.so. It does not execute DSP firmware. */
+static void xg1000_yamaha_reply(XG1000UART *s, uint8_t reg, uint8_t value)
+{
+    const uint8_t msg[] = { 0xf0, 0x43, 0x7c, 9, 0x10,
+                            0, 0, reg, value, 0xf7 };
+
+    if (sizeof(msg) > sizeof(s->rx) - s->rx_count) {
+        return;
+    }
+    for (unsigned i = 0; i < sizeof(msg); i++) {
+        s->rx[(s->rx_head + s->rx_count++) % sizeof(s->rx)] = msg[i];
+    }
+}
+
+static void xg1000_yamaha_tx(XG1000UART *s, uint8_t byte)
+{
+    if (byte == 0xf0) {
+        s->tx_count = 0;
+    }
+    if (s->tx_count == sizeof(s->tx)) {
+        s->tx_count = 0;
+        return;
+    }
+    s->tx[s->tx_count++] = byte;
+    if (byte != 0xf7) {
+        return;
+    }
+    if (s->tx_count == 10 &&
+        !memcmp(s->tx, (uint8_t[]) { 0xf0, 0x43, 0x7c, 9, 0x20 }, 5) &&
+        s->tx[5] == 0 && s->tx[6] == 0) {
+        /* Bulk parameter request: start register and last offset. */
+        for (unsigned i = 0; i <= s->tx[8]; i++) {
+            unsigned reg = s->tx[7] + i;
+            uint8_t value = reg == 1 ? 0x7f : 0;
+
+            /* Synthetic 0x2000 protected/download version. */
+            if (reg == 2 || reg == 4) {
+                value = 0x20;
+            }
+            xg1000_yamaha_reply(s, reg, value);
+        }
+    } else if (s->tx_count == 10 &&
+               !memcmp(s->tx, (uint8_t[]) { 0xf0, 0x43, 0x7c, 9, 0x10,
+                                          0, 0, 0, 0, 0xf7 }, 10)) {
+        xg1000_yamaha_reply(s, 1, 0x7f);
+    }
+    s->tx_count = 0;
+}
 
 static uint64_t xg1000_uart_read(void *opaque, hwaddr addr, unsigned size)
 {
-    /* No peripheral is attached: both FIFO counts are zero. */
+    XG1000UART *s = opaque;
+
+    if (s->yamaha) {
+        if (addr == 8 && qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) >=
+                         s->next_power_status) {
+            xg1000_yamaha_reply(s, 1, 0x7f);
+            s->next_power_status = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                                   NANOSECONDS_PER_SECOND;
+        }
+        if (addr == 8) {
+            return s->rx_count;
+        }
+        if (addr == 0 && s->rx_count) {
+            uint8_t byte = s->rx[s->rx_head];
+            s->rx_head = (s->rx_head + 1) % sizeof(s->rx);
+            s->rx_count--;
+            return byte;
+        }
+    }
     return 0;
 }
 
@@ -154,6 +226,9 @@ static void xg1000_uart_write(void *opaque, hwaddr addr,
 
     if (addr == 0) {
         uint8_t byte = value;
+        if (s->yamaha) {
+            xg1000_yamaha_tx(s, byte);
+        }
         qemu_chr_fe_write_all(&s->chr, &byte, 1);
     } else if (addr == 8) {
         s->baud = value;
@@ -166,6 +241,15 @@ static const MemoryRegionOps xg1000_uart_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid = { .min_access_size = 2, .max_access_size = 2 },
 };
+
+static void xg1000_uart_reset(void *opaque)
+{
+    XG1000UART *s = opaque;
+
+    s->baud = 0;
+    s->rx_head = s->rx_count = s->tx_count = 0;
+    s->next_power_status = 0;
+}
 
 static void xg1000_uart_init(MemoryRegion *sysmem)
 {
@@ -189,6 +273,7 @@ static void xg1000_uart_init(MemoryRegion *sysmem)
 
     for (unsigned i = 0; i < ARRAY_SIZE(ports); i++) {
         XG1000UART *s = g_new0(XG1000UART, 1);
+        s->yamaha = ports[i].base == 0x4c009800;
         g_autofree char *name = g_strdup_printf("xg1000-fpga-uart%u", i + 1);
         Chardev *chr = serial_hd(i + 2);
 
@@ -198,6 +283,7 @@ static void xg1000_uart_init(MemoryRegion *sysmem)
         qemu_chr_fe_init(&s->chr, chr, &error_fatal);
         memory_region_init_io(&s->mmio, NULL, &xg1000_uart_ops, s, name, ports[i].size);
         memory_region_add_subregion_overlap(sysmem, ports[i].base, &s->mmio, 3);
+        qemu_register_reset(xg1000_uart_reset, s);
     }
 }
 
