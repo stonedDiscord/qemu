@@ -9,7 +9,7 @@
 #include "qemu/osdep.h"
 #include "qemu/target-info.h"
 #include "qemu/target-info-qapi.h"
-#include "qemu/target-info-impl.h"
+#include "qemu/target-info-def.h"
 #include "qapi/error.h"
 
 const char *target_name(void)
@@ -61,6 +61,16 @@ bool target_arm(void)
 bool target_aarch64(void)
 {
     return target_arch() == SYS_EMU_TARGET_AARCH64;
+}
+
+bool target_m68k(void)
+{
+    return target_arch() == SYS_EMU_TARGET_M68K;
+}
+
+bool target_or1k(void)
+{
+    return target_arch() == SYS_EMU_TARGET_OR1K;
 }
 
 bool target_base_ppc(void)
