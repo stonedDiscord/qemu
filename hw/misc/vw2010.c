@@ -14,6 +14,10 @@
 OBJECT_DECLARE_SIMPLE_TYPE(VW2010State, VW2010)
 
 #define VW_BAR_SIZE 0x40000
+#define VW_MIPS_READY 0x0a000000
+
+/* Firmware mailbox word addresses for encoder and decoder RAM modes. */
+static const uint32_t vw_ready_addr[2] = { 0xfc600, 0x800 };
 
 struct VW2010State {
     PCIDevice parent_obj;
@@ -97,6 +101,33 @@ static void vw_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
             } else {
                 g_hash_table_remove(s->ram[bank], GUINT_TO_POINTER(key));
             }
+        }
+    }
+
+    /*
+     * libGooSystem's startMIPs releases the processor with register 0x13=4.
+     * waitForReadyCode polls ERAM[0xfc600], or DRAM[0x800] when register
+     * 0x11 bit 15 selects decoder RAM. Emulate only this boot handshake;
+     * uploaded microcode is not executed. Register 0x13=0 holds reset, and
+     * nonzero register 0x1e asserts the decoder reset lines.
+     */
+    if ((addr < 0x16028 && addr + size > 0x16026) ||
+        (addr < 0x1603e && addr + size > 0x1603c)) {
+        uint16_t control = lduw_le_p(s->regs + 0x15026);
+        uint16_t reset = lduw_le_p(s->regs + 0x1503c);
+
+        if (control == 0 || reset != 0) {
+            for (unsigned bank = 0; bank < 2; bank++) {
+                g_hash_table_remove(s->ram[bank],
+                                    GUINT_TO_POINTER(vw_ready_addr[bank]));
+            }
+        } else if (control == 4 &&
+                   addr < 0x16028 && addr + size > 0x16026) {
+            unsigned bank = !!(lduw_le_p(s->regs + 0x15022) & 0x8000);
+
+            g_hash_table_insert(s->ram[bank],
+                                GUINT_TO_POINTER(vw_ready_addr[bank]),
+                                GUINT_TO_POINTER(VW_MIPS_READY));
         }
     }
 }
