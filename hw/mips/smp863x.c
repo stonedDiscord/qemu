@@ -35,6 +35,8 @@
 #include "system/blockdev.h"
 #include "system/block-backend-global-state.h"
 #include "system/block-backend-io.h"
+#include "ui/console.h"
+#include "ui/surface.h"
 #include "target/mips/cpu.h"
 #include "hw/misc/xg1000-front.h"
 #include "net/net.h"
@@ -99,6 +101,8 @@
 #define TANGOX_SCARD_BASE      0x6c300
 #define TANGOX_ENET_MAC_BASE   0x26000
 #define TANGOX_ENET_DMA_BASE   0x27000
+#define XG1000_LCD_WIDTH       480
+#define XG1000_LCD_HEIGHT      234
 
 typedef struct SMP863XState {
     MIPSCPU *cpu;
@@ -132,6 +136,20 @@ typedef struct SMP863XState {
     bitbang_i2c_interface rtc_i2c;
     int rtc_sda;
     XG1000Front *front;
+    MemoryRegion lcd_regs;
+    uint8_t lcd_reg_data[0x1000];
+    QemuConsole *lcd_console;
+    uint16_t lcd_pixels[XG1000_LCD_WIDTH * XG1000_LCD_HEIGHT];
+    uint8_t lcd_transfer[0x800];
+    unsigned lcd_transfer_count;
+    bool lcd_has_frame;
+    uint32_t lcd_row_address;
+    uint16_t lcd_row_count;
+    uint16_t lcd_color;
+    uint32_t lcd_base_address;
+    bool lcd_base_valid;
+    uint32_t lcd_pitch;
+    uint32_t lcd_previous_address;
 } SMP863XState;
 
 /* uart.ko and midi_mod.ko use 16-bit FPGA FIFOs, not 16550 banks. */
@@ -707,28 +725,106 @@ static void smp863x_pci_set_irq(void *opaque, int irq, int level)
 }
 
 /*
- * Local LCD transfer handshake only; pixel storage and scanout are absent.
+ * Local TFT LCD model. The guest sends RGB565 rows through the controller
+ * window and starts each transfer at offset 0x80a. Keep the transfer FIFO
+ * deliberately small; the real driver submits one row at a time.
  * libGooSystem's CScreen::Clear/PutBox writes a row and starts the transfer
  * at 0x4c00b80a, then waits for bit 0 at 0x4c00b80c. With no asynchronous
  * consumer modeled, accept the row immediately. Keep this status read-only
  * and leave the neighboring control/data registers in their existing RAM.
  */
-static uint64_t xg1000_lcd_status_read(void *opaque, hwaddr addr, unsigned size)
+static bool xg1000_lcd_update(void *opaque)
 {
-    return addr == 0 ? 1 : 0;
+    SMP863XState *s = opaque;
+    DisplaySurface *surface = qemu_console_surface(s->lcd_console);
+    uint32_t *dst = surface_data(surface);
+    int stride = surface_stride(surface) / 4;
+
+    for (unsigned y = 0; y < XG1000_LCD_HEIGHT; y++) {
+        for (unsigned x = 0; x < XG1000_LCD_WIDTH; x++) {
+            uint16_t p = s->lcd_pixels[y * 480 + x];
+            dst[y * stride + x] = ((p >> 11) & 31) << 19 |
+                                  ((p >> 5) & 63) << 10 |
+                                  (p & 31) << 3;
+        }
+    }
+    qemu_console_update_full(s->lcd_console);
+    return true;
 }
 
-static void xg1000_lcd_status_write(void *opaque, hwaddr addr,
-                                    uint64_t value, unsigned size)
+static const GraphicHwOps xg1000_lcd_graphic_ops = {
+    .gfx_update = xg1000_lcd_update,
+};
+
+static uint64_t xg1000_lcd_read(void *opaque, hwaddr addr, unsigned size)
 {
+    SMP863XState *s = opaque;
+    uint64_t value = 0;
+    if (addr == 0x80c) {
+        return 1;
+    }
+    for (unsigned i = 0; i < size; i++) {
+        value |= (uint64_t)s->lcd_reg_data[(addr + i) & 0xfff] << (i * 8);
+    }
+    return value;
 }
 
-static const MemoryRegionOps xg1000_lcd_status_ops = {
-    .read = xg1000_lcd_status_read,
-    .write = xg1000_lcd_status_write,
+static void xg1000_lcd_write(void *opaque, hwaddr addr,
+                             uint64_t value, unsigned size)
+{
+    SMP863XState *s = opaque;
+    for (unsigned i = 0; i < size && addr + i < sizeof(s->lcd_reg_data); i++) {
+        s->lcd_reg_data[addr + i] = value >> (i * 8);
+    }
+    if (addr == 0x80a) {
+        if (s->lcd_base_valid && s->lcd_row_count) {
+            uint32_t pitch = s->lcd_pitch ?: 240;
+            uint32_t pos = s->lcd_row_address - s->lcd_base_address;
+            unsigned y = pos / pitch;
+            unsigned x = (pos % pitch) * 2;
+            unsigned width = MIN((unsigned)s->lcd_row_count * 2,
+                                 XG1000_LCD_WIDTH - x);
+
+            if (y < XG1000_LCD_HEIGHT && x < XG1000_LCD_WIDTH) {
+                for (unsigned i = 0; i < width; i++) {
+                    s->lcd_pixels[y * XG1000_LCD_WIDTH + x + i] = s->lcd_color;
+                }
+                s->lcd_has_frame = true;
+            }
+            qemu_console_update_full(s->lcd_console);
+        }
+        s->lcd_transfer_count = 0;
+        return;
+    }
+    if (addr == 0x800) {
+        s->lcd_row_address = value;
+        if (!s->lcd_base_valid) {
+            s->lcd_pitch = 240;
+            s->lcd_base_address = value - (value % s->lcd_pitch);
+            s->lcd_base_valid = true;
+        } else if (s->lcd_previous_address != s->lcd_row_address) {
+            uint32_t delta = s->lcd_row_address - s->lcd_previous_address;
+            if (delta >= 100 && delta <= 1000) {
+                s->lcd_pitch = delta;
+            }
+        }
+        s->lcd_previous_address = s->lcd_row_address;
+    } else if (addr == 0x808) {
+        s->lcd_row_count = value;
+    } else if (addr == 0x804 || addr == 0x806) {
+        s->lcd_color = value;
+    }
+    for (unsigned i = 0; i < size && addr + i < sizeof(s->lcd_transfer); i++) {
+        s->lcd_transfer[addr + i] = value >> (i * 8);
+        s->lcd_transfer_count = MAX(s->lcd_transfer_count, addr + i + 1);
+    }
+}
+
+static const MemoryRegionOps xg1000_lcd_ops = {
+    .read = xg1000_lcd_read,
+    .write = xg1000_lcd_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid = { .min_access_size = 1, .max_access_size = 2 },
-    .impl = { .min_access_size = 1, .max_access_size = 2 },
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
 };
 
 static void smp863x_timer_cb(void *opaque)
@@ -1478,16 +1574,15 @@ static void smp863x_init_common(MachineState *machine, bool front_panel_uart)
          * give the LCD window private storage so decoder initialisation can
          * probe and program it without aliasing NOR contents.
          */
-        MemoryRegion *lcd_regs = g_new(MemoryRegion, 1);
-        memory_region_init_ram(lcd_regs, NULL, "xg1000-lcd-stub",
-                               0x1000, &error_fatal);
+        memory_region_init_io(&s->lcd_regs, NULL, &xg1000_lcd_ops, s,
+                              "xg1000-tft-lcd", 0x10000);
         memory_region_add_subregion_overlap(sysmem, 0x4c00b000ULL,
-                                            lcd_regs, 3);
-        MemoryRegion *lcd_status = g_new(MemoryRegion, 1);
-        memory_region_init_io(lcd_status, NULL, &xg1000_lcd_status_ops, NULL,
-                              "xg1000-lcd-transfer-status", 2);
-        memory_region_add_subregion_overlap(sysmem, 0x4c00b80cULL,
-                                            lcd_status, 4);
+                                            &s->lcd_regs, 3);
+        s->lcd_console = qemu_graphic_console_create(NULL, 0,
+                                                      &xg1000_lcd_graphic_ops,
+                                                      s);
+        qemu_console_resize(s->lcd_console, XG1000_LCD_WIDTH,
+                            XG1000_LCD_HEIGHT);
     }
     if (s->flash_boot) {
         MemoryRegion *boot_alias = g_new(MemoryRegion, 1);
