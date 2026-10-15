@@ -406,7 +406,10 @@ static void em86xx_video_decode(EM86XXState *s, hwaddr vti)
         codec_id = AV_CODEC_ID_MPEG2VIDEO;
         break;
     default:
-        return;
+        /* The XG1000 firmware reports newer WMV profiles as opaque values;
+         * the opening clips are WMV3/WMV9 bitstreams despite that value. */
+        codec_id = AV_CODEC_ID_WMV3;
+        break;
     }
     input = g_malloc(count + AV_INPUT_BUFFER_PADDING_SIZE);
     if (address_space_read(&address_space_memory, base + rd,

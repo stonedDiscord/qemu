@@ -146,6 +146,8 @@ typedef struct SMP863XState {
     uint32_t lcd_row_address;
     uint16_t lcd_row_count;
     uint16_t lcd_color;
+    uint16_t lcd_row_pixels[XG1000_LCD_WIDTH];
+    unsigned lcd_row_pixel_count;
     uint32_t lcd_base_address;
     bool lcd_base_valid;
     uint32_t lcd_pitch;
@@ -787,13 +789,16 @@ static void xg1000_lcd_write(void *opaque, hwaddr addr,
 
             if (y < XG1000_LCD_HEIGHT && x < XG1000_LCD_WIDTH) {
                 for (unsigned i = 0; i < width; i++) {
-                    s->lcd_pixels[y * XG1000_LCD_WIDTH + x + i] = s->lcd_color;
+                    uint16_t color = i < s->lcd_row_pixel_count ?
+                                     s->lcd_row_pixels[i] : s->lcd_color;
+                    s->lcd_pixels[y * XG1000_LCD_WIDTH + x + i] = color;
                 }
                 s->lcd_has_frame = true;
             }
             qemu_console_update_full(s->lcd_console);
         }
         s->lcd_transfer_count = 0;
+        s->lcd_row_pixel_count = 0;
         return;
     }
     if (addr == 0x800) {
@@ -813,6 +818,9 @@ static void xg1000_lcd_write(void *opaque, hwaddr addr,
         s->lcd_row_count = value;
     } else if (addr == 0x804 || addr == 0x806) {
         s->lcd_color = value;
+        if (s->lcd_row_pixel_count < XG1000_LCD_WIDTH) {
+            s->lcd_row_pixels[s->lcd_row_pixel_count++] = value;
+        }
     }
     for (unsigned i = 0; i < size && addr + i < sizeof(s->lcd_transfer); i++) {
         s->lcd_transfer[addr + i] = value >> (i * 8);
