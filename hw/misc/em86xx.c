@@ -37,6 +37,17 @@ typedef struct AudioSlot {
 #endif
 } AudioSlot;
 
+typedef struct VideoDecoder {
+    AVCodecContext *codec;
+    AVPacket *packet;
+    AVFrame *frame;
+    enum AVCodecID codec_id;
+    hwaddr context;
+    hwaddr fifo;
+    uint32_t rd;
+    uint32_t frames;
+} VideoDecoder;
+
 struct EM86XXState {
     SysBusDevice parent_obj;
     MemoryRegion regs_region;
@@ -55,6 +66,7 @@ struct EM86XXState {
     QEMUTimer *display_timer;
     QEMUTimer *video_timer;
     QemuConsole *console;
+    VideoDecoder video_decoder;
 };
 
 /* Local XG1000 experiment for the supplied em8xxx.ko shared-memory ABI.
@@ -356,10 +368,181 @@ static void em86xx_audio_tick(void *opaque)
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
 }
 
+#ifdef CONFIG_XG1000_AUDIO_FFMPEG
+static void em86xx_video_decode(EM86XXState *s, hwaddr vti)
+{
+    VideoDecoder *v = &s->video_decoder;
+    hwaddr context = vti - 0x2098;
+    hwaddr fifo = context + 0x4c;
+    uint32_t base = em86xx_shared_read(fifo);
+    uint32_t size = em86xx_shared_read(fifo + 4);
+    uint32_t rd = em86xx_shared_read(fifo + 8);
+    uint32_t wr = em86xx_shared_read(fifo + 12);
+    uint32_t profile = em86xx_shared_read(context + 0x84);
+    enum AVCodecID codec_id;
+    uint8_t *input;
+    uint32_t count;
+
+    if (!em86xx_dram_range(base, size) || !size || rd >= size ||
+        wr >= size || rd == wr || size > 8 * 1024 * 1024) {
+        return;
+    }
+    count = wr > rd ? wr - rd : size - rd;
+    if (!count) {
+        return;
+    }
+    switch (profile) {
+    case 1:
+        codec_id = AV_CODEC_ID_MPEG2VIDEO;
+        break;
+    case 5:
+        codec_id = AV_CODEC_ID_VC1;
+        break;
+    case 6:
+        codec_id = AV_CODEC_ID_WMV3;
+        break;
+    case 0:
+    case 0x1000:
+        codec_id = AV_CODEC_ID_MPEG2VIDEO;
+        break;
+    default:
+        return;
+    }
+    input = g_malloc(count + AV_INPUT_BUFFER_PADDING_SIZE);
+    if (address_space_read(&address_space_memory, base + rd,
+                           MEMTXATTRS_UNSPECIFIED, input, count) != MEMTX_OK) {
+        g_free(input);
+        return;
+    }
+    if (!v->codec || v->codec_id != codec_id) {
+        const AVCodec *codec = avcodec_find_decoder(codec_id);
+        if (!codec) {
+            g_free(input);
+            return;
+        }
+        avcodec_free_context(&v->codec);
+        av_packet_free(&v->packet);
+        av_frame_free(&v->frame);
+        v->codec = avcodec_alloc_context3(codec);
+        v->packet = av_packet_alloc();
+        v->frame = av_frame_alloc();
+        if (!v->codec || !v->packet || !v->frame ||
+            avcodec_open2(v->codec, codec, NULL) < 0) {
+            avcodec_free_context(&v->codec);
+            av_packet_free(&v->packet);
+            av_frame_free(&v->frame);
+            g_free(input);
+            return;
+        }
+        v->codec_id = codec_id;
+        v->frames = 0;
+    }
+    av_packet_unref(v->packet);
+    if (av_new_packet(v->packet, count) < 0) {
+        g_free(input);
+        return;
+    }
+    memcpy(v->packet->data, input, count);
+    g_free(input);
+    em86xx_shared_write(fifo + 8, wr);
+    if (avcodec_send_packet(v->codec, v->packet) < 0) {
+        return;
+    }
+    int received = 0;
+    while (avcodec_receive_frame(v->codec, v->frame) == 0) {
+        received = 1;
+        hwaddr picture = context + 0x298;
+        hwaddr luma = em86xx_shared_read(picture);
+        hwaddr luma_stride = em86xx_shared_read(picture + 4);
+        hwaddr chroma = em86xx_shared_read(picture + 8);
+        hwaddr chroma_stride = em86xx_shared_read(picture + 12);
+        unsigned w = v->frame->width, h = v->frame->height;
+        if (!em86xx_dram_range(luma, luma_stride * h) ||
+            !em86xx_dram_range(chroma, chroma_stride * ((h + 1) / 2))) {
+            continue;
+        }
+        for (unsigned y = 0; y < h; y++) {
+            address_space_write(&address_space_memory, luma + y * luma_stride,
+                MEMTXATTRS_UNSPECIFIED, v->frame->data[0] + y * v->frame->linesize[0], w);
+        }
+        for (unsigned y = 0; y < (h + 1) / 2; y++) {
+            uint8_t *uv = g_malloc((w + 1) & ~1U);
+            for (unsigned x = 0; x < (w + 1) / 2; x++) {
+                uv[x * 2] = v->frame->data[1][y * v->frame->linesize[1] + x];
+                uv[x * 2 + 1] = v->frame->data[2][y * v->frame->linesize[2] + x];
+            }
+            address_space_write(&address_space_memory, chroma + y * chroma_stride,
+                MEMTXATTRS_UNSPECIFIED, uv, (w + 1) & ~1U);
+            g_free(uv);
+        }
+        em86xx_shared_write(picture + 0x30, w);
+        em86xx_shared_write(picture + 0x34, h);
+        em86xx_shared_write(picture + 0xb8, 0);
+        em86xx_shared_write(picture + 0xbc, 1);
+        em86xx_shared_write(picture + 0xec, ++v->frames);
+        /* Publish the picture pointer in the decoder display FIFO. */
+        hwaddr df = context + 0x80;
+        uint32_t db = em86xx_shared_read(df), ds = em86xx_shared_read(df + 4);
+        uint32_t dw = em86xx_shared_read(df + 12);
+        if (em86xx_dram_range(db, ds) && ds >= 8 && dw < ds - 4) {
+            em86xx_shared_write(db + dw, picture);
+            em86xx_shared_write(df + 12, dw + 4);
+        }
+        em86xx_shared_write(0x617f8, em86xx_shared_read(0x617f8) | (1U << 23));
+        em86xx_shared_write(0x6e010, 1U << 23);
+    }
+    /* MPEG-2 commonly holds the first I-frame until the decoder is flushed.
+     * WMV/VC-1 may legitimately buffer a packet across timer ticks. */
+    if (!received && codec_id == AV_CODEC_ID_MPEG2VIDEO &&
+        avcodec_send_packet(v->codec, NULL) >= 0 &&
+        avcodec_receive_frame(v->codec, v->frame) == 0) {
+        hwaddr picture = context + 0x298;
+        hwaddr luma = em86xx_shared_read(picture);
+        hwaddr chroma = em86xx_shared_read(picture + 8);
+        hwaddr ls = em86xx_shared_read(picture + 4);
+        hwaddr cs = em86xx_shared_read(picture + 12);
+        unsigned w = v->frame->width, h = v->frame->height;
+        if (em86xx_dram_range(luma, ls * h) &&
+            em86xx_dram_range(chroma, cs * ((h + 1) / 2))) {
+            for (unsigned y = 0; y < h; y++) {
+                address_space_write(&address_space_memory, luma + y * ls,
+                    MEMTXATTRS_UNSPECIFIED, v->frame->data[0] + y * v->frame->linesize[0], w);
+            }
+            for (unsigned y = 0; y < (h + 1) / 2; y++) {
+                uint8_t *uv = g_malloc((w + 1) & ~1U);
+                for (unsigned x = 0; x < (w + 1) / 2; x++) {
+                    uv[2 * x] = v->frame->data[1][y * v->frame->linesize[1] + x];
+                    uv[2 * x + 1] = v->frame->data[2][y * v->frame->linesize[2] + x];
+                }
+                address_space_write(&address_space_memory, chroma + y * cs,
+                    MEMTXATTRS_UNSPECIFIED, uv, (w + 1) & ~1U);
+                g_free(uv);
+            }
+            em86xx_shared_write(picture + 0x30, w);
+            em86xx_shared_write(picture + 0x34, h);
+            em86xx_shared_write(picture + 0xb8, 0);
+            em86xx_shared_write(picture + 0xbc, 1);
+            hwaddr df = context + 0x80;
+            uint32_t db = em86xx_shared_read(df), ds = em86xx_shared_read(df + 4);
+            uint32_t dw = em86xx_shared_read(df + 12);
+            if (em86xx_dram_range(db, ds) && ds >= 8 && dw < ds - 4) {
+                em86xx_shared_write(db + dw, picture);
+                em86xx_shared_write(df + 12, dw + 4);
+            }
+        }
+        avcodec_flush_buffers(v->codec);
+    }
+}
+#else
+static void em86xx_video_decode(EM86XXState *s, hwaddr vti)
+{
+}
+#endif
+
 /* Local video firmware stub for the supplied em8xxx ABI. The driver installs
  * an IRQ task with pointers to the VTI mask/status words. The VTI command is
- * two words before that mask. Complete control commands only; no compressed
- * stream is consumed and no decoded pictures are fabricated.
+ * two words before that mask. Control commands and the opt-in MPEG-2/WMV
+ * picture paths are handled here; newer codecs remain unsupported.
  */
 static void em86xx_video_tick(void *opaque)
 {
@@ -372,8 +555,9 @@ static void em86xx_video_tick(void *opaque)
              em86xx_task_address(task); n++) {
             uint32_t module = em86xx_shared_read(task + 0x28);
             uint32_t flags = em86xx_shared_read(task + 0x2c);
-            hwaddr mask = em86xx_shared_read(task + 8);
-            hwaddr irq = em86xx_shared_read(task + 12);
+            /* +8 is the GBUS mutex, followed by mask/status pointers. */
+            hwaddr mask = em86xx_shared_read(task + 12);
+            hwaddr irq = em86xx_shared_read(task + 16);
             if ((module & 0xff) == 0x1a && !(flags & 3) &&
                 mask >= 8 && em86xx_dram_range(mask - 8, 16) &&
                 irq == mask + 4 && em86xx_dram_range(irq, 4)) {
@@ -381,6 +565,7 @@ static void em86xx_video_tick(void *opaque)
                 /* video_get_irq_info returns VTI+8/+12, so the command
                  * is mask-8 and decoder state is mask-4. FF is idle. */
                 uint32_t cmd = em86xx_shared_read(command);
+                em86xx_video_decode(s, command);
                 if (cmd <= 7 && cmd != 5 &&
                     (em86xx_shared_read(mask) & 1)) {
                     em86xx_shared_write(command + 4, cmd == 1 ? 2 : cmd);
@@ -448,6 +633,42 @@ static bool em86xx_display_update(void *opaque)
         unsigned w = em86xx_shared_read(pic + 0x18);
         unsigned h = em86xx_shared_read(pic + 0x1c);
         hwaddr pixels = em86xx_shared_read(pic);
+        if ((mode == 7 || mode == 8) &&
+            (!w || !h || w > 4096 || h > 4096)) {
+            w = em86xx_shared_read(pic + 0x30);
+            h = em86xx_shared_read(pic + 0x34);
+        }
+        if ((mode == 7 || mode == 8) && w && h) {
+            hwaddr yaddr = em86xx_shared_read(pic);
+            hwaddr ystride = em86xx_shared_read(pic + 4);
+            hwaddr uvaddr = em86xx_shared_read(pic + 8);
+            hwaddr uvstride = em86xx_shared_read(pic + 12);
+            if (em86xx_display_address(yaddr, ystride * h) &&
+                em86xx_display_address(uvaddr, uvstride * ((h + 1) / 2))) {
+                for (unsigned y = 0; y < height; y++) {
+                    unsigned sy = (uint64_t)y * h / height;
+                    for (unsigned x = 0; x < width; x++) {
+                        unsigned sx = (uint64_t)x * w / width;
+                        uint8_t yy, uu, vv;
+                        address_space_read(&address_space_memory,
+                            yaddr + sy * ystride + sx, MEMTXATTRS_UNSPECIFIED,
+                            &yy, 1);
+                        address_space_read(&address_space_memory,
+                            uvaddr + (sy / 2) * uvstride + (sx & ~1U),
+                            MEMTXATTRS_UNSPECIFIED, &uu, 1);
+                        address_space_read(&address_space_memory,
+                            uvaddr + (sy / 2) * uvstride + (sx & ~1U) + 1,
+                            MEMTXATTRS_UNSPECIFIED, &vv, 1);
+                        int r = yy + ((359 * (vv - 128)) >> 8);
+                        int g = yy - ((88 * (uu - 128) + 183 * (vv - 128)) >> 8);
+                        int b = yy + ((454 * (uu - 128)) >> 8);
+                        dst[y * stride + x] = (CLAMP(r, 0, 255) << 16) |
+                            (CLAMP(g, 0, 255) << 8) | CLAMP(b, 0, 255);
+                    }
+                }
+            }
+            continue;
+        }
         unsigned bpp = mode == 4 ? 1 : 4;
         if (!w || !h || w > 1920 || h > 4320 ||
             (mode != 4 && !((mode == 5 || mode == 6) && format == 4)) ||
