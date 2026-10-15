@@ -235,6 +235,23 @@ static void xg1000_yamaha_tx(XG1000UART *s, uint8_t byte)
         }
     } else if (s->tx_count == 10 &&
                !memcmp(s->tx, (uint8_t[]) { 0xf0, 0x43, 0x7c, 9, 0x10,
+                                          0 }, 6) &&
+               (s->tx[6] == 0x16 || s->tx[6] == 0x18) &&
+               (s->tx[7] < 8 ||
+                (s->tx[7] >= 0x10 && s->tx[7] < 0x1c) ||
+                (s->tx[7] >= 0x20 && s->tx[7] < 0x2c)) &&
+               s->tx[8] < 0x80) {
+        /* PEQ parameter change acknowledgment. The library's SysEx receive
+         * handler stores the echoed value in ymhDSPv; guest shared memory
+         * is managed entirely by the guest, not by this peripheral. */
+        if (s->tx_count <= sizeof(s->rx) - s->rx_count) {
+            for (unsigned i = 0; i < s->tx_count; i++) {
+                s->rx[(s->rx_head + s->rx_count++) % sizeof(s->rx)] =
+                    s->tx[i];
+            }
+        }
+    } else if (s->tx_count == 10 &&
+               !memcmp(s->tx, (uint8_t[]) { 0xf0, 0x43, 0x7c, 9, 0x10,
                                           0, 0, 0, 0, 0xf7 }, 10)) {
         xg1000_yamaha_reply(s, 1, 0x7f);
     }
