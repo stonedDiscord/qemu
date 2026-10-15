@@ -88,9 +88,13 @@ config FW_CFG_MIPS
     bool
 
 config SMP863X
-    select IDE_MMIO
     bool
     default y
+    depends on MIPS
+    select IDE_MMIO
+    select PCI
     select PFLASH_CFI02
     select BITBANG_I2C
     select AT24C
+    select USB_EHCI_SYSBUS
+    select USB_OHCI_SYSBUS
