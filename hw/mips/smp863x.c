@@ -104,6 +104,7 @@
 #define TANGOX_ENET_DMA_BASE   0x27000
 #define XG1000_LCD_WIDTH       480
 #define XG1000_LCD_HEIGHT      234
+#define XG1000_LCD_RAM_PIXELS  (512 * 8192)
 
 typedef struct SMP863XState {
     MIPSCPU *cpu;
@@ -141,19 +142,14 @@ typedef struct SMP863XState {
     uint8_t lcd_reg_data[0x1000];
     QemuConsole *lcd_console;
     DeviceState *media;
-    uint16_t lcd_pixels[XG1000_LCD_WIDTH * XG1000_LCD_HEIGHT];
+    uint16_t *lcd_pixels;
     uint8_t lcd_transfer[0x800];
     unsigned lcd_transfer_count;
-    bool lcd_has_frame;
     uint32_t lcd_row_address;
     uint16_t lcd_row_count;
     uint16_t lcd_color;
     uint16_t lcd_row_pixels[XG1000_LCD_WIDTH];
     unsigned lcd_row_pixel_count;
-    uint32_t lcd_base_address;
-    bool lcd_base_valid;
-    uint32_t lcd_pitch;
-    uint32_t lcd_previous_address;
 } SMP863XState;
 
 /* uart.ko and midi_mod.ko use 16-bit FPGA FIFOs, not 16550 banks. */
@@ -746,9 +742,23 @@ static bool xg1000_lcd_update(void *opaque)
 
     bool video = s->media && em86xx_tft_scanout(s->media, dst,
                          XG1000_LCD_WIDTH, XG1000_LCD_HEIGHT, stride);
+    /* Create/ScrollX/ScrollY select two independent TFT pages. Each row
+     * occupies 256 pairs (512 pixels), even though only 480 are visible.
+     * The application puts the loading sprite on page 5, behind page 4's
+     * progress bar. Keep off-screen writes until a viewport selects them.
+     */
+    uint32_t front = lduw_le_p(s->lcd_reg_data + 0x810) +
+                     ((uint32_t)lduw_le_p(s->lcd_reg_data + 0x812) << 8);
+    uint32_t back = lduw_le_p(s->lcd_reg_data + 0x814) +
+                    ((uint32_t)lduw_le_p(s->lcd_reg_data + 0x816) << 8);
     for (unsigned y = 0; y < XG1000_LCD_HEIGHT; y++) {
         for (unsigned x = 0; x < XG1000_LCD_WIDTH; x++) {
-            uint16_t p = s->lcd_pixels[y * XG1000_LCD_WIDTH + x];
+            unsigned f = front * 2 + y * 512 + x;
+            unsigned b = back * 2 + y * 512 + x;
+            uint16_t p = f < XG1000_LCD_RAM_PIXELS ? s->lcd_pixels[f] : 0;
+            if (!p && b < XG1000_LCD_RAM_PIXELS) {
+                p = s->lcd_pixels[b];
+            }
             if (video && !p) {
                 continue;
             }
@@ -786,41 +796,20 @@ static void xg1000_lcd_write(void *opaque, hwaddr addr,
         s->lcd_reg_data[addr + i] = value >> (i * 8);
     }
     if (addr == 0x80a) {
-        if (s->lcd_base_valid && s->lcd_row_count) {
-            uint32_t pitch = s->lcd_pitch ?: 240;
-            uint32_t pos = s->lcd_row_address - s->lcd_base_address;
-            unsigned y = pos / pitch;
-            unsigned x = (pos % pitch) * 2;
-            unsigned width = MIN((unsigned)s->lcd_row_count * 2,
-                                 XG1000_LCD_WIDTH - x);
-
-            if (y < XG1000_LCD_HEIGHT && x < XG1000_LCD_WIDTH) {
-                for (unsigned i = 0; i < width; i++) {
-                    uint16_t color = i < s->lcd_row_pixel_count ?
-                                     s->lcd_row_pixels[i] : s->lcd_color;
-                    s->lcd_pixels[y * XG1000_LCD_WIDTH + x + i] = color;
-                }
-                s->lcd_has_frame = true;
-            }
-            qemu_console_update_full(s->lcd_console);
+        uint64_t pos = (uint64_t)s->lcd_row_address * 2;
+        unsigned count = MIN((unsigned)s->lcd_row_count * 2, 512U);
+        for (unsigned i = 0; i < count && pos + i < XG1000_LCD_RAM_PIXELS;
+             i++) {
+            s->lcd_pixels[pos + i] = i < s->lcd_row_pixel_count ?
+                                    s->lcd_row_pixels[i] : s->lcd_color;
         }
+        qemu_console_update_full(s->lcd_console);
         s->lcd_transfer_count = 0;
         s->lcd_row_pixel_count = 0;
         return;
     }
     if (addr == 0x800) {
         s->lcd_row_address = value;
-        if (!s->lcd_base_valid) {
-            s->lcd_pitch = 240;
-            s->lcd_base_address = value - (value % s->lcd_pitch);
-            s->lcd_base_valid = true;
-        } else if (s->lcd_previous_address != s->lcd_row_address) {
-            uint32_t delta = s->lcd_row_address - s->lcd_previous_address;
-            if (delta >= 100 && delta <= 1000) {
-                s->lcd_pitch = delta;
-            }
-        }
-        s->lcd_previous_address = s->lcd_row_address;
     } else if (addr == 0x808) {
         s->lcd_row_count = value;
     } else if (addr == 0x804 || addr == 0x806) {
@@ -1593,6 +1582,7 @@ static void smp863x_init_common(MachineState *machine, bool front_panel_uart)
                               "xg1000-tft-lcd", 0x10000);
         memory_region_add_subregion_overlap(sysmem, 0x4c00b000ULL,
                                             &s->lcd_regs, 3);
+        s->lcd_pixels = g_new0(uint16_t, XG1000_LCD_RAM_PIXELS);
         s->lcd_console = qemu_graphic_console_create(NULL, 0,
                                                       &xg1000_lcd_graphic_ops,
                                                       s);
