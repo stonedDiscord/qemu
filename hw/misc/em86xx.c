@@ -35,6 +35,7 @@ typedef struct AudioSlot {
     AVChannelLayout layout;
     uint8_t pcm[65536];
     size_t pcm_pos, pcm_size;
+    uint32_t bytes_read;
 #endif
 } AudioSlot;
 
@@ -116,6 +117,7 @@ static void em86xx_audio_discard(AudioSlot *slot)
     swr_free(&slot->resampler);
     av_channel_layout_uninit(&slot->layout);
     slot->pcm_pos = slot->pcm_size = 0;
+    slot->bytes_read = 0;
 #endif
 }
 
@@ -139,15 +141,23 @@ static void em86xx_audio_decode(AudioSlot *slot)
     hwaddr fifo = 0x100000 + slot->offset - 0x58 +
                   ((slot - s->audio_slots) % 2 ? 4 : 0);
     uint32_t base, size, rd, wr, count;
-    uint8_t input[4096 + AV_INPUT_BUFFER_PADDING_SIZE] = { 0 };
+    uint8_t input[65536 + AV_INPUT_BUFFER_PADDING_SIZE] = { 0 };
     AVPacket *packet;
     AVFrame *frame;
     int consumed;
+    unsigned profile = ldl_le_p(ram + slot->offset + 16) & 0x7f;
+    bool wma = profile == 7;
 
     if (!slot->playing || slot->pcm_pos != slot->pcm_size ||
         (s->audio_blocked & (1U << (slot - s->audio_slots))) ||
-        (ldl_le_p(ram + slot->offset + 16) & 0xff) != 2) {
+        (profile != 2 && !wma)) {
         return;
+    }
+    if (wma) {
+        fifo = em86xx_shared_read(fifo + 0x24);
+        if (fifo < 0x10000000 || fifo > 0x18000000 - 20) {
+            return;
+        }
     }
     base = em86xx_shared_read(fifo);
     size = em86xx_shared_read(fifo + 4);
@@ -160,13 +170,62 @@ static void em86xx_audio_decode(AudioSlot *slot)
         size > 0x18000000 - base || rd >= size || wr >= size || rd == wr) {
         return;
     }
-    count = MIN(sizeof(input) - AV_INPUT_BUFFER_PADDING_SIZE,
-                MIN(wr > rd ? wr - rd : size - rd, size - rd));
+    count = (wr + size - rd) % size;
+    if (wma) {
+        /* audio_set_wma_parameters packs rate/channels in word 0,
+         * ASF block alignment in word 1, options in word 2 and bitrate
+         * in word 4. audio_set_command copies these after the profile.
+         */
+        unsigned block_bits = ldl_le_p(ram + slot->offset + 20);
+        unsigned block = block_bits / 8;
+        if (block_bits & 7) {
+            return;
+        }
+        if (!block || block > sizeof(input) - AV_INPUT_BUFFER_PADDING_SIZE ||
+            count < block) {
+            return;
+        }
+        count = block;
+    } else {
+        count = MIN(4096U, MIN(count, size - rd));
+    }
+    unsigned first = MIN(count, size - rd);
     if (address_space_read(&address_space_memory, base + rd,
-                           MEMTXATTRS_UNSPECIFIED, input, count) != MEMTX_OK) {
+                           MEMTXATTRS_UNSPECIFIED, input, first) != MEMTX_OK ||
+        (first < count && address_space_read(&address_space_memory, base,
+            MEMTXATTRS_UNSPECIFIED, input + first, count - first) != MEMTX_OK)) {
         return;
     }
-    if (!slot->parser) {
+    if (wma && !slot->decoder) {
+        static const int rates[] = {
+            8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100,
+            48000, 64000, 88200, 96000, 128000, 176400, 192000
+        };
+        unsigned config = ldl_le_p(ram + slot->offset + 16) >> 8;
+        unsigned rate = (config >> 4) & 0xf;
+        unsigned channels = (config >> 12) & 0xf;
+        const AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_WMAV2);
+        if (!codec || rate >= ARRAY_SIZE(rates) || !channels || channels > 2 ||
+            (config & 0xf)) {
+            return;
+        }
+        slot->decoder = avcodec_alloc_context3(codec);
+        if (!slot->decoder) {
+            return;
+        }
+        slot->decoder->sample_rate = rates[rate];
+        av_channel_layout_default(&slot->decoder->ch_layout, channels);
+        slot->decoder->block_align = count;
+        slot->decoder->bit_rate = ldl_le_p(ram + slot->offset + 32);
+        slot->decoder->extradata = av_mallocz(6 + AV_INPUT_BUFFER_PADDING_SIZE);
+        slot->decoder->extradata_size = 6;
+        stw_le_p(slot->decoder->extradata + 4,
+                 ldl_le_p(ram + slot->offset + 24) & 0xffff);
+        if (avcodec_open2(slot->decoder, codec, NULL) < 0) {
+            avcodec_free_context(&slot->decoder);
+            return;
+        }
+    } else if (!wma && !slot->parser) {
         slot->parser = av_parser_init(AV_CODEC_ID_MP3);
         slot->decoder = avcodec_alloc_context3(NULL);
         if (!slot->parser || !slot->decoder) {
@@ -181,17 +240,44 @@ static void em86xx_audio_decode(AudioSlot *slot)
         av_frame_free(&frame);
         return;
     }
-    consumed = av_parser_parse2(slot->parser, slot->decoder,
-                               &packet->data, &packet->size, input, count,
-                               AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
+    if (wma) {
+        packet->data = input;
+        packet->size = count;
+        consumed = count;
+    } else {
+        consumed = av_parser_parse2(slot->parser, slot->decoder,
+                                   &packet->data, &packet->size, input, count,
+                                   AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
+    }
     if (consumed > 0) {
         em86xx_shared_write(fifo + 8, (rd + consumed) % size);
+        slot->bytes_read += consumed;
+        unsigned index = slot - s->audio_slots;
+        hwaddr pf = em86xx_shared_read(0x190850 + (index / 2) * 0x20000 +
+                                       (index % 2) * 20);
+        if (pf >= 0x10000000 && pf <= 0x18000000 - 16) {
+            uint32_t pb = em86xx_shared_read(pf);
+            uint32_t ps = em86xx_shared_read(pf + 4);
+            uint32_t pr = em86xx_shared_read(pf + 8);
+            uint32_t pw = em86xx_shared_read(pf + 12);
+            if (ps && ps <= 65536 && pr < ps && pw < ps &&
+                pb >= 0x10000000 && pb <= 0x18000000 - ps * 8) {
+                for (unsigned n = 0; n < ps && pr != pw; n++) {
+                    if ((int32_t)(em86xx_shared_read(pb + pr * 8) -
+                                  slot->bytes_read) > 0) {
+                        break;
+                    }
+                    pr = (pr + 1) % ps;
+                }
+                em86xx_shared_write(pf + 8, pr);
+            }
+        }
     }
     if (packet->size >= 4) {
         unsigned layer = (packet->data[1] >> 1) & 3;
         enum AVCodecID id = layer == 3 ? AV_CODEC_ID_MP1 :
                             layer == 2 ? AV_CODEC_ID_MP2 : AV_CODEC_ID_MP3;
-        if (!slot->decoder->codec || slot->decoder->codec_id != id) {
+        if (!wma && (!slot->decoder->codec || slot->decoder->codec_id != id)) {
             avcodec_free_context(&slot->decoder);
             slot->decoder = avcodec_alloc_context3(avcodec_find_decoder(id));
             if (!slot->decoder || avcodec_open2(slot->decoder,
@@ -263,7 +349,7 @@ static void em86xx_audio_transfer(EM86XXState *s, hwaddr task)
     for (i = 0; i < ARRAY_SIZE(s->audio_slots); i++) {
         hwaddr expected = 0x100000 + s->audio_slots[i].offset - 0x58 +
                           (i % 2 ? 4 : 0);
-        if (fifo == expected) {
+        if (fifo == expected || fifo == em86xx_shared_read(expected + 0x24)) {
             break;
         }
     }
@@ -405,8 +491,10 @@ static void em86xx_audio_tick(void *opaque)
                          ldl_le_p(ram + offset + 4) | 1);
                 em86xx_shared_write(task + 0x20,
                                     em86xx_shared_read(task + 0x20) | 1);
+                em86xx_shared_write(task + 0x1c,
+                                    em86xx_shared_read(task + 0x1c) | 1);
                 em86xx_shared_write(task + 0x2c,
-                                    em86xx_shared_read(task + 0x2c) | 0x22);
+                                    em86xx_shared_read(task + 0x2c) | 0x23);
                 em86xx_shared_write(0x617f8,
                                     em86xx_shared_read(0x617f8) | 0x10);
                 em86xx_shared_write(0x6e010, 0x10);
@@ -713,6 +801,22 @@ static void em86xx_video_decode(EM86XXState *s, hwaddr vti, unsigned engine)
     /* This is an eraser FIFO: the driver's DMA completion owns erase_ptr. */
     if (codec_id == AV_CODEC_ID_WMV3) {
         em86xx_shared_write(pf + 8, (pr + 1) % ps);
+    } else if (ps && ps <= 65536 && pr < ps && pw < ps &&
+               em86xx_dram_range(pb, ps * 8)) {
+        /* MPEG/VC-1 use the parser for packet boundaries, but their PTS
+         * queue still needs a firmware consumer.  Leaving these entries
+         * behind eventually makes data_fifo_pts_writable reject SendData
+         * even while the bitstream FIFO has plenty of free space.
+         * PTS offsets, like in-band offsets, are cumulative byte counts.
+         */
+        for (unsigned n = 0; n < ps && pr != pw; n++) {
+            if ((int32_t)(em86xx_shared_read(pb + pr * 8) -
+                          v->bytes_read) > 0) {
+                break;
+            }
+            pr = (pr + 1) % ps;
+        }
+        em86xx_shared_write(pf + 8, pr);
     }
     if (packet_size) {
         av_packet_unref(v->packet);
@@ -756,7 +860,7 @@ static void em86xx_video_tick(void *opaque)
             /* +8 is the GBUS mutex, followed by mask/status pointers. */
             hwaddr mask = em86xx_shared_read(task + 12);
             hwaddr irq = em86xx_shared_read(task + 16);
-            if ((module & 0xff) == 0x1a && !(flags & 3) &&
+            if ((module & 0xff) == 0x1a &&
                 mask >= 8 && em86xx_dram_range(mask - 8, 16) &&
                 irq == mask + 4 && em86xx_dram_range(irq, 4)) {
                 hwaddr command = mask - 8;
@@ -765,6 +869,14 @@ static void em86xx_video_tick(void *opaque)
                 uint32_t cmd = em86xx_shared_read(command);
                 uint32_t events = 0;
                 em86xx_video_decode(s, command, engine);
+                /* A pending guest callback must not stop the firmware's
+                 * bitstream consumer.  Retain new events until the guest
+                 * releases the task, then deliver them normally.
+                 */
+                if (flags & 3) {
+                    task = em86xx_shared_read(task);
+                    continue;
+                }
 #ifdef CONFIG_XG1000_AUDIO_FFMPEG
                 events = s->video_decoder[engine].events &
                          em86xx_shared_read(mask);
