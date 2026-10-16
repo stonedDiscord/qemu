@@ -138,6 +138,8 @@ typedef struct SMP863XState {
     bitbang_i2c_interface rtc_i2c;
     int rtc_sda;
     XG1000Front *front;
+    MemoryRegion fpga_gpio;
+    uint16_t fpga_gpio_output;
     MemoryRegion lcd_regs;
     uint8_t lcd_reg_data[0x1000];
     QemuConsole *lcd_console;
@@ -656,6 +658,32 @@ static const MemoryRegionOps smp863x_flash_window_ops = {
     .write = smp863x_flash_window_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid = { .min_access_size = 1, .max_access_size = 4 },
+};
+
+/* fpga_gpio_mod.ko FPGA_Send/FPGA_Read access this 16-bit output latch.
+ * Bit 5 carries the software-timed CL2/3 pulse stream. Other bits belong
+ * to independent board outputs and must survive changes to that line.
+ */
+static uint64_t xg1000_fpga_gpio_read(void *opaque, hwaddr addr, unsigned size)
+{
+    SMP863XState *s = opaque;
+
+    return s->fpga_gpio_output;
+}
+
+static void xg1000_fpga_gpio_write(void *opaque, hwaddr addr,
+                                  uint64_t value, unsigned size)
+{
+    SMP863XState *s = opaque;
+
+    s->fpga_gpio_output = value;
+}
+
+static const MemoryRegionOps xg1000_fpga_gpio_ops = {
+    .read = xg1000_fpga_gpio_read,
+    .write = xg1000_fpga_gpio_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 2, .max_access_size = 2 },
 };
 
 /* A small, valid XENV block.  The Linux image needs this because its
@@ -1286,6 +1314,7 @@ static void smp863x_cpu_reset(void *opaque)
     CPUMIPSState *env = &s->cpu->env;
     cpu_reset(CPU(s->cpu));
     env->CP0_Status &= ~((1 << CP0St_BEV) | (1 << CP0St_ERL));
+    s->fpga_gpio_output = 0;
     if (s->flash_boot) {
         env->active_tc.gpr[4] = 0;
         env->active_tc.gpr[5] = 0;
@@ -1653,6 +1682,10 @@ static void smp863x_init_common(MachineState *machine, bool front_panel_uart)
         memory_region_add_subregion_overlap(sysmem, 0x3f8, uart0_pc, 1);
     }
     if (front_panel_uart) {
+        memory_region_init_io(&s->fpga_gpio, NULL, &xg1000_fpga_gpio_ops, s,
+                              "xg1000-fpga-gpio", 2);
+        memory_region_add_subregion_overlap(sysmem, 0x4c00a000,
+                                            &s->fpga_gpio, 3);
         xg1000_uart_init(sysmem);
         s->front = xg1000_front_new();
         xg1000_front_init(s->front, sysmem,
