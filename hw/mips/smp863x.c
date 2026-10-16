@@ -127,7 +127,6 @@ typedef struct SMP863XState {
     uint64_t irq_enable;
     uint64_t irq_status;
     uint64_t device_irq_levels;
-    uint32_t xtal_counter;
     uint32_t regs[0x100000 / 4];
     QEMUTimer *timer;
     bool timer_enabled;
@@ -929,7 +928,12 @@ static uint32_t smp863x_regs_read32(SMP863XState *s, hwaddr addr)
     case 0x10000 + 0x0018: /* SYS_clkgen3_pll: 603 MHz before dividers. */
         return 0x01010041;
     case 0x10000 + 0x0048: /* SYS_xtal_in_cnt, 27 MHz */
-        return s->xtal_counter += 1000;
+        /* TangoX udelay polls this free-running counter. Advancing it on
+         * reads makes software pulse widths depend on host execution speed.
+         * Keep the hardware's 32-bit wraparound at the register boundary.
+         */
+        return (uint32_t)muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                                 27000000, 1000000000);
     case 0x20000 + 0xfee8: /* PCI_REG0 */
         return 0x00008630;
     case 0x20000 + 0xfeec: /* PCI_REG1 */
