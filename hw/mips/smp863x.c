@@ -39,6 +39,7 @@
 #include "ui/surface.h"
 #include "target/mips/cpu.h"
 #include "hw/misc/xg1000-front.h"
+#include "hw/misc/em86xx.h"
 #include "net/net.h"
 
 #define SMP863X_DRAM_BASE       0x10000000ULL
@@ -139,6 +140,7 @@ typedef struct SMP863XState {
     MemoryRegion lcd_regs;
     uint8_t lcd_reg_data[0x1000];
     QemuConsole *lcd_console;
+    DeviceState *media;
     uint16_t lcd_pixels[XG1000_LCD_WIDTH * XG1000_LCD_HEIGHT];
     uint8_t lcd_transfer[0x800];
     unsigned lcd_transfer_count;
@@ -742,9 +744,14 @@ static bool xg1000_lcd_update(void *opaque)
     uint32_t *dst = surface_data(surface);
     int stride = surface_stride(surface) / 4;
 
+    bool video = s->media && em86xx_tft_scanout(s->media, dst,
+                         XG1000_LCD_WIDTH, XG1000_LCD_HEIGHT, stride);
     for (unsigned y = 0; y < XG1000_LCD_HEIGHT; y++) {
         for (unsigned x = 0; x < XG1000_LCD_WIDTH; x++) {
-            uint16_t p = s->lcd_pixels[y * 480 + x];
+            uint16_t p = s->lcd_pixels[y * XG1000_LCD_WIDTH + x];
+            if (video && !p) {
+                continue;
+            }
             dst[y * stride + x] = ((p >> 11) & 31) << 19 |
                                   ((p >> 5) & 63) << 10 |
                                   (p & 31) << 3;
@@ -1665,6 +1672,8 @@ static void smp863x_init_common(MachineState *machine, bool front_panel_uart)
     memory_region_add_subregion(sysmem, SMP863X_REG_BASE, cpuregs);
     {
         DeviceState *media = qdev_new("em86xx");
+        s->media = media;
+        media->id = g_strdup("xg-media");
 
         sysbus_realize_and_unref(SYS_BUS_DEVICE(media), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(media), 0, 0x70000);
