@@ -25,6 +25,7 @@ typedef struct AudioSlot {
     EM86XXState *owner;
     unsigned offset;
     bool playing;
+    uint32_t events;
     SWVoiceOut *voice;
 #ifdef CONFIG_XG1000_AUDIO_FFMPEG
     AVCodecParserContext *parser;
@@ -107,6 +108,7 @@ static bool em86xx_task_address(hwaddr addr)
 static void em86xx_audio_discard(AudioSlot *slot)
 {
     slot->playing = false;
+    slot->events = 0;
     if (slot->voice) {
         audio_be_set_active_out(slot->owner->audio_be, slot->voice, false);
     }
@@ -475,8 +477,34 @@ static void em86xx_audio_tick(void *opaque)
     }
 
     for (unsigned i = 0; i < ARRAY_SIZE(s->audio_slots); i++) {
-        em86xx_audio_decode(&s->audio_slots[i]);
-        if (!(s->audio_pending & (1U << i))) {
+        AudioSlot *slot = &s->audio_slots[i];
+        em86xx_audio_decode(slot);
+#ifdef CONFIG_XG1000_AUDIO_FFMPEG
+        /* audio_get_inband_fifo returns a DRAM entry eraser FIFO. Retire
+         * EOS only after its byte coordinate and the queued PCM have drained;
+         * the driver owns erase_ptr and exposes the consumed tag to RUA.
+         */
+        hwaddr ib = em86xx_shared_read(0x190828 + (i / 2) * 0x20000 +
+                                      (i % 2) * 20);
+        if (slot->playing && slot->pcm_pos == slot->pcm_size &&
+            !(s->audio_blocked & (1U << i)) && em86xx_dram_range(ib, 20)) {
+            uint32_t base = em86xx_shared_read(ib);
+            uint32_t size = em86xx_shared_read(ib + 4);
+            uint32_t rd = em86xx_shared_read(ib + 8);
+            uint32_t wr = em86xx_shared_read(ib + 12);
+            if (size && size <= 256 && rd < size && wr < size && rd != wr &&
+                em86xx_dram_range(base, size * 64) &&
+                (em86xx_shared_read(base + rd * 64) & 0xff) == 0x16 &&
+                (int32_t)(em86xx_shared_read(base + rd * 64 + 4) -
+                          slot->bytes_read) <= 0) {
+                em86xx_shared_write(ib + 8, (rd + 1) % size);
+                slot->events |= 8;
+            }
+        }
+#endif
+        uint32_t events = slot->events |
+                          ((s->audio_pending & (1U << i)) ? 1 : 0);
+        if (!events) {
             continue;
         }
         hwaddr head = 0x1000526c + (i / 2) * 8;
@@ -488,17 +516,18 @@ static void em86xx_audio_tick(void *opaque)
                 (0x1c + i * 0x100) &&
                 !(em86xx_shared_read(task + 0x2c) & 2)) {
                 stl_le_p(ram + offset + 4,
-                         ldl_le_p(ram + offset + 4) | 1);
+                         ldl_le_p(ram + offset + 4) | events);
                 em86xx_shared_write(task + 0x20,
-                                    em86xx_shared_read(task + 0x20) | 1);
+                                    em86xx_shared_read(task + 0x20) | events);
                 em86xx_shared_write(task + 0x1c,
-                                    em86xx_shared_read(task + 0x1c) | 1);
+                                    em86xx_shared_read(task + 0x1c) | events);
                 em86xx_shared_write(task + 0x2c,
                                     em86xx_shared_read(task + 0x2c) | 0x23);
                 em86xx_shared_write(0x617f8,
                                     em86xx_shared_read(0x617f8) | 0x10);
                 em86xx_shared_write(0x6e010, 0x10);
                 s->audio_pending &= ~(1U << i);
+                slot->events = 0;
                 break;
             }
             task = em86xx_shared_read(task);
@@ -1445,8 +1474,8 @@ static void em86xx_realize(DeviceState *dev, Error **errp)
 
 static const Property em86xx_properties[] = {
     DEFINE_AUDIO_PROPERTIES(EM86XXState, audio_be),
-    DEFINE_PROP_BOOL("xg1000-audio-stub", EM86XXState, audio_stub, false),
-    DEFINE_PROP_BOOL("xg1000-display-assist", EM86XXState, display_assist, false),
+    DEFINE_PROP_BOOL("xg1000-audio-stub", EM86XXState, audio_stub, true),
+    DEFINE_PROP_BOOL("xg1000-display-assist", EM86XXState, display_assist, true),
 };
 
 static void em86xx_class_init(ObjectClass *klass, const void *data)
