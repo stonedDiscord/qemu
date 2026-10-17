@@ -34,4 +34,4 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: qemu
-          path: build/qemu-*.exe
+          path: build/qemu-system-mipsel.exe
