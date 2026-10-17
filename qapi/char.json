@@ -232,6 +232,23 @@
   'base': 'ChardevCommon' }
 
 ##
+# @ChardevMidi:
+#
+# Host MIDI output, for hardware interfaces and software synthesizers.
+#
+# @path: ALSA sequencer destination (client:port or name:port) on
+#     Linux; WinMM output index or exact device name on Windows.  If
+#     omitted, create a subscribable ALSA source port or use the
+#     Windows MIDI mapper.
+#
+# Since: 11.2
+##
+{ 'struct': 'ChardevMidi',
+  'data': { '*path': 'str' },
+  'base': 'ChardevCommon',
+  'if': 'CONFIG_CHARDEV_MIDI' }
+
+##
 # @ChardevSocket:
 #     Configuration info for (stream) socket chardevs.
 #
@@ -471,6 +488,8 @@
 #
 # @serial: serial host device
 #
+# @midi: host MIDI output (since 11.2)
+#
 # @parallel: parallel host device
 #
 # @pipe: pipes (since 1.5)
@@ -521,6 +540,7 @@
 ##
 { 'enum': 'ChardevBackendKind',
   'data': [ 'file',
+            { 'name': 'midi', 'if': 'CONFIG_CHARDEV_MIDI' },
             { 'name': 'serial', 'if': 'HAVE_CHARDEV_SERIAL' },
             { 'name': 'parallel', 'if': 'HAVE_CHARDEV_PARALLEL' },
             'pipe',
@@ -563,6 +583,17 @@
 ##
 { 'struct': 'ChardevHostdevWrapper',
   'data': { 'data': 'ChardevHostdev' } }
+
+##
+# @ChardevMidiWrapper:
+#
+# @data: MIDI backend configuration
+#
+# Since: 11.2
+##
+{ 'struct': 'ChardevMidiWrapper',
+  'data': { 'data': 'ChardevMidi' },
+  'if': 'CONFIG_CHARDEV_MIDI' }
 
 ##
 # @ChardevSocketWrapper:
@@ -710,6 +741,8 @@
   'base': { 'type': 'ChardevBackendKind' },
   'discriminator': 'type',
   'data': { 'file': 'ChardevFileWrapper',
+            'midi': { 'type': 'ChardevMidiWrapper',
+                      'if': 'CONFIG_CHARDEV_MIDI' },
             'serial': { 'type': 'ChardevHostdevWrapper',
                         'if': 'HAVE_CHARDEV_SERIAL' },
             'parallel': { 'type': 'ChardevHostdevWrapper',

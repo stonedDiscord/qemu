@@ -2,6 +2,7 @@
 testblock = declare_dependency(dependencies: [block], sources: 'iothread.c')
 
 tests = {
+  'test-midi-parser': ['../../chardev/midi-parser.c'],
   'check-block-qdict': [],
   'check-qdict': [],
   'check-qnum': [],
@@ -51,6 +52,12 @@ tests = {
   'test-fifo': [],
   'test-envlist': [],
 }
+
+if host_os == 'linux' and alsa.found()
+  tests += {
+    'test-midi-alsa': ['../../chardev/midi-alsa.c', alsa],
+  }
+endif
 
 if have_system or have_tools
   tests += {

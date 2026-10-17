@@ -4108,6 +4108,9 @@ DEF("chardev", HAS_ARG, QEMU_OPTION_chardev,
     "-chardev ringbuf,id=id[,size=size][,logfile=PATH][,logappend=on|off]\n"
     "-chardev file,id=id,path=path[,input-path=input-file][,mux=on|off][,logfile=PATH][,logappend=on|off]\n"
     "-chardev pipe,id=id,path=path[,mux=on|off][,logfile=PATH][,logappend=on|off]\n"
+#ifdef CONFIG_CHARDEV_MIDI
+    "-chardev midi,id=id[,path=destination]\n"
+#endif
 #ifdef _WIN32
     "-chardev console,id=id[,mux=on|off][,logfile=PATH][,logappend=on|off]\n"
     "-chardev serial,id=id,path=path[,mux=on|off][,logfile=PATH][,logappend=on|off]\n"
@@ -4398,6 +4401,16 @@ The available backends are:
     does not take any options.
 
     ``console`` is only available on Windows hosts.
+
+``-chardev midi,id=id[,path=destination]``
+    Send a MIDI byte stream to a host hardware interface or software synth.
+    Linux uses ALSA sequencer ports: ``path`` selects a destination such as
+    ``128:0`` or ``FLUID Synth:0``. Omit it to create a source port that can
+    be connected using ``aconnect`` or Qsynth's connection tools.
+    Windows uses WinMM: ``path`` selects an output index or exact port name;
+    omitting it selects the MIDI mapper. ``path=help`` reports Windows ports.
+    A software synth on Windows must expose a WinMM MIDI input, possibly
+    through a virtual MIDI cable. This backend provides output only.
 
 ``-chardev serial,id=id,path=path``
     Send traffic from the guest to a serial device on the host.

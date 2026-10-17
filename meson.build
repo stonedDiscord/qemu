@@ -2283,6 +2283,8 @@ endif
 #################
 
 config_host_data = configuration_data()
+config_host_data.set('CONFIG_CHARDEV_MIDI',
+                     host_os == 'windows' or (host_os == 'linux' and alsa.found()))
 config_host_data.set('CONFIG_XG1000_AUDIO_FFMPEG', xg_audio_deps.length() != 0)
 
 config_host_data.set('CONFIG_HMP', have_hmp)

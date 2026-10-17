@@ -14,6 +14,11 @@ chardev_ss.add(files(
   'char.c',
 ))
 if host_os == 'windows'
+  chardev_ss.add(files('char-midi.c', 'midi-parser.c', 'midi-winmm.c'), winmm)
+elif host_os == 'linux' and alsa.found()
+  chardev_ss.add(files('char-midi.c', 'midi-parser.c', 'midi-alsa.c'), alsa)
+endif
+if host_os == 'windows'
   chardev_ss.add(files(
     'char-console.c',
     'char-win-stdio.c',
