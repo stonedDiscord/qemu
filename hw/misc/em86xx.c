@@ -34,7 +34,8 @@ typedef struct AudioSlot {
     int sample_rate;
     enum AVSampleFormat sample_format;
     AVChannelLayout layout;
-    uint8_t pcm[65536];
+    uint8_t *pcm;
+    size_t pcm_capacity;
     size_t pcm_pos, pcm_size;
     uint32_t bytes_read;
 #endif
@@ -117,20 +118,40 @@ static void em86xx_audio_discard(AudioSlot *slot)
     slot->parser = NULL;
     avcodec_free_context(&slot->decoder);
     swr_free(&slot->resampler);
+    g_clear_pointer(&slot->pcm, g_free);
+    slot->pcm_capacity = 0;
     av_channel_layout_uninit(&slot->layout);
     slot->pcm_pos = slot->pcm_size = 0;
     slot->bytes_read = 0;
 #endif
 }
 
+static void em86xx_audio_decode(AudioSlot *slot);
+
 static void em86xx_audio_out(void *opaque, int available)
 {
 #ifdef CONFIG_XG1000_AUDIO_FFMPEG
     AudioSlot *slot = opaque;
-    if (slot->playing && slot->pcm_pos < slot->pcm_size) {
-        slot->pcm_pos += audio_be_write(slot->owner->audio_be, slot->voice,
+
+    /* A backend request may span several decoded blocks. Refill immediately
+     * instead of leaving the rest silent until the next firmware tick. Bound
+     * decoding work when the input contains headers but produces no PCM.
+     */
+    for (unsigned n = 0; slot->playing && available > 0 && n < 32; n++) {
+        if (slot->pcm_pos == slot->pcm_size) {
+            em86xx_audio_decode(slot);
+            if (slot->pcm_pos == slot->pcm_size) {
+                break;
+            }
+        }
+        size_t written = audio_be_write(slot->owner->audio_be, slot->voice,
             slot->pcm + slot->pcm_pos,
             MIN((size_t)available, slot->pcm_size - slot->pcm_pos));
+        if (!written) {
+            break;
+        }
+        slot->pcm_pos += written;
+        available -= written;
     }
 #endif
 }
@@ -309,8 +330,20 @@ static void em86xx_audio_decode(AudioSlot *slot)
                 goto done;
             }
         }
+        /* WMA superframes can contain more than 16384 stereo samples.
+         * Keep the whole converted block: a fixed 64 KiB destination leaves
+         * an increasing resampler delay which is lost when EOS closes it.
+         */
+        int capacity = swr_get_out_samples(slot->resampler, frame->nb_samples);
+        if (capacity <= 0 || capacity > 1024 * 1024) {
+            goto done;
+        }
+        if ((size_t)capacity * 4 > slot->pcm_capacity) {
+            slot->pcm_capacity = (size_t)capacity * 4;
+            slot->pcm = g_realloc(slot->pcm, slot->pcm_capacity);
+        }
         uint8_t *out = slot->pcm;
-        int samples = swr_convert(slot->resampler, &out, sizeof(slot->pcm) / 4,
+        int samples = swr_convert(slot->resampler, &out, capacity,
                                   (const uint8_t **)frame->extended_data,
                                   frame->nb_samples);
         if (samples > 0) {
