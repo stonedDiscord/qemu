@@ -160,6 +160,8 @@ typedef struct XG1000UART {
     uint16_t baud;
     bool yamaha;
     bool tg;
+    struct XG1000UART *tg_reply;
+    uint8_t tg_selector, tg_key;
     uint8_t rx[512], tx[256];
     unsigned rx_head, rx_count, tx_count;
     int64_t next_power_status;
@@ -168,44 +170,99 @@ typedef struct XG1000UART {
 /* Initialization-only TG model inferred from libymhOkdPlayer.so.
  * The two TGs return 0xfe at startup, then a bulk version response.
  * No tone generation or firmware download is implemented. */
-static void xg1000_tg_tx(XG1000UART *s, uint8_t byte)
+static void xg1000_tg_version(XG1000UART *s)
 {
-    static const uint8_t request[] = {
-        0xf0, 0x43, 0x30, 0x31, 3, 0, 0, 0, 0, 0x10, 0x6d, 0xf7
-    };
     uint8_t reply[] = {
         0xf0, 0x43, 0, 0x31, 3, 0, 0, 0x23, 'M', '0', '0',
         0, 0, 0, 0, 0, 0, 0, '2', '.', '0', '5', 0, 0xf7
     };
     unsigned sum = 0;
 
-    if (byte == 0xf0) {
-        s->tx_count = 0;
+    /* Both MIDI inputs of a TG return plaintext on its primary port. */
+    s = s->tg_reply;
+    s->next_power_status = INT64_MAX;
+    for (unsigned i = 4; i < sizeof(reply) - 2; i++) {
+        sum += reply[i];
     }
-    if (s->tx_count == sizeof(s->tx)) {
-        s->tx_count = 0;
-        return;
+    reply[sizeof(reply) - 2] = -sum & 0x7f;
+    if (sizeof(reply) <= sizeof(s->rx) - s->rx_count) {
+        for (unsigned i = 0; i < sizeof(reply); i++) {
+            s->rx[(s->rx_head + s->rx_count++) % sizeof(s->rx)] = reply[i];
+        }
+    }
+}
+
+static void xg1000_tg_tx(XG1000UART *s, uint8_t byte)
+{
+    static const uint8_t request[] = {
+        0xf0, 0x43, 0x30, 0x31, 3, 0, 0, 0, 0, 0x10, 0x6d, 0xf7
+    };
+    static const uint8_t reset[] = {
+        0xf0, 0x43, 0x75, 0x72, 0x73, 0, 0, 0, 0, 0, 7, 7, 0xf7
+    };
+    static const uint8_t encoded_request[] = {
+        0x26, 0x3f, 0x7b, 0x35, 0x27, 0xa2, 0xa2, 0xa2,
+        0xa2, 0xb9, 0x64, 0x90
+    };
+    const uint8_t *packet;
+    bool match = true;
+
+    /* A rolling window also handles encoded bytes equal to f0 or f7.
+     * Only the initialization version query is recognized in scrambled
+     * form; this is not a general MIDI decoder or a tone generator.
+     */
+    if (s->tx_count == 14) {
+        memmove(s->tx, s->tx + 1, --s->tx_count);
     }
     s->tx[s->tx_count++] = byte;
-    if (byte != 0xf7) {
+    if (s->tx_count >= sizeof(reset) &&
+        !memcmp(s->tx + s->tx_count - sizeof(reset), reset, sizeof(reset))) {
+        s->tg_selector = s->tg_key = 0;
+        s->tx_count = 0;
         return;
     }
-    if (s->tx_count == sizeof(request) &&
-        !memcmp(s->tx, request, sizeof(request))) {
-        /* Stop repeating the startup notification once queried. */
-        s->next_power_status = INT64_MAX;
-        for (unsigned i = 4; i < sizeof(reply) - 2; i++) {
-            sum += reply[i];
-        }
-        reply[sizeof(reply) - 2] = -sum & 0x7f;
-        if (sizeof(reply) <= sizeof(s->rx) - s->rx_count) {
-            for (unsigned i = 0; i < sizeof(reply); i++) {
-                s->rx[(s->rx_head + s->rx_count++) % sizeof(s->rx)] =
-                    reply[i];
+    if (s->tx_count == 14 &&
+        !memcmp(s->tx, (uint8_t[]) { 0xf0, 0x43, 0x75, 0x72, 0x73 }, 5) &&
+        s->tx[13] == 0xf7) {
+        /* Offsets 5 and 11 derive from the previous setup's offsets
+         * 10 and 12. Both change when ymhTgOpen reuses the packet.
+         */
+        unsigned sum = 0;
+        unsigned selector = (s->tx[7] + s->tx[8] + s->tx[9]) & 3;
+
+        for (unsigned i = 5; i <= 12; i++) {
+            if (s->tx[i] & 0x80) {
+                return;
             }
+            sum += s->tx[i];
         }
+        if (!(sum & 0x7f) && selector) {
+            s->tg_selector = selector;
+            s->tg_key = s->tx[6] + s->tx[7] + s->tx[8];
+            s->tx_count = 0;
+        }
+        return;
     }
-    s->tx_count = 0;
+    if (s->tx_count < sizeof(request)) {
+        return;
+    }
+    packet = s->tx + s->tx_count - sizeof(request);
+    for (unsigned i = 0; i < sizeof(request); i++) {
+        uint8_t expected = request[i];
+
+        if (s->tg_selector) {
+            expected = encoded_request[i];
+            if (i == 9 && s->tg_selector != 1) {
+                expected = 0x3a;
+            }
+            expected ^= s->tg_key;
+        }
+        match &= packet[i] == expected;
+    }
+    if (match) {
+        xg1000_tg_version(s);
+        s->tx_count = 0;
+    }
 }
 
 /* Local initialization-only Yamaha DSP model, inferred from
@@ -315,7 +372,7 @@ static void xg1000_uart_write(void *opaque, hwaddr addr,
         uint8_t byte = value;
         if (s->yamaha) {
             xg1000_yamaha_tx(s, byte);
-        } else if (s->tg) {
+        } else if (s->tg_reply) {
             xg1000_tg_tx(s, byte);
         }
         qemu_chr_fe_write_all(&s->chr, &byte, 1);
@@ -339,6 +396,7 @@ static void xg1000_uart_reset(void *opaque)
     XG1000UART *s = opaque;
 
     s->baud = 0;
+    s->tg_selector = s->tg_key = 0;
     s->rx_head = s->rx_count = s->tx_count = 0;
     s->next_power_status = 0;
 }
@@ -363,11 +421,20 @@ static void xg1000_uart_init(MemoryRegion *sysmem)
         { 0x4c009800, 0x20 },
     };
 
+    XG1000UART *tg_primary = NULL;
+
     for (unsigned i = 0; i < ARRAY_SIZE(ports); i++) {
         XG1000UART *s = g_new0(XG1000UART, 1);
         s->yamaha = ports[i].base == 0x4c009800;
         s->tg = ports[i].base == 0x4c008000 ||
                 ports[i].base == 0x4c008040;
+        if (s->tg) {
+            tg_primary = s;
+            s->tg_reply = s;
+        } else if (ports[i].base == 0x4c008020 ||
+                   ports[i].base == 0x4c008060) {
+            s->tg_reply = tg_primary;
+        }
         g_autofree char *name = g_strdup_printf("xg1000-fpga-uart%u", i + 1);
         Chardev *chr = serial_hd(i + 2);
 
@@ -667,7 +734,11 @@ static uint64_t xg1000_fpga_gpio_read(void *opaque, hwaddr addr, unsigned size)
 {
     SMP863XState *s = opaque;
 
-    return s->fpga_gpio_output;
+    /* GPIO_Get(0) reads the active-low external-video detector here.
+     * The low output bits select the input being sampled; they are not
+     * looped back as signal presence. No external source is connected.
+     */
+    return s->fpga_gpio_output | 1;
 }
 
 static void xg1000_fpga_gpio_write(void *opaque, hwaddr addr,
