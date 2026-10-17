@@ -901,7 +901,8 @@ static void xg1000_lcd_write(void *opaque, hwaddr addr,
             s->lcd_pixels[pos + i] = i < s->lcd_row_pixel_count ?
                                     s->lcd_row_pixels[i] : s->lcd_color;
         }
-        qemu_console_update_full(s->lcd_console);
+        /* The refresh callback publishes the composed frame. A row transfer
+         * only changes controller RAM, not the console surface yet. */
         s->lcd_transfer_count = 0;
         s->lcd_row_pixel_count = 0;
         return;

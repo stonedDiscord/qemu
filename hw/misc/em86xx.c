@@ -1026,6 +1026,8 @@ static void em86xx_display_render(EM86XXState *s, uint32_t *dst, int stride,
                                   unsigned width, unsigned height,
                                   bool graphics_only)
 {
+    g_autofree unsigned *xmap = g_new(unsigned, width);
+
     memset(dst, 0, stride * 4 * height);
     for (unsigned l = 0; l < ARRAY_SIZE(em86xx_layers); l++) {
         if (graphics_only && l != 1) {
@@ -1070,10 +1072,13 @@ static void em86xx_display_render(EM86XXState *s, uint32_t *dst, int stride,
                 address_space_read(&address_space_memory, uvaddr,
                                    MEMTXATTRS_UNSPECIFIED, uvp,
                                    uvstride * ((h + 1) / 2));
+                for (unsigned x = 0; x < width; x++) {
+                    xmap[x] = (uint64_t)x * w / width;
+                }
                 for (unsigned y = 0; y < height; y++) {
                     unsigned sy = (uint64_t)y * h / height;
                     for (unsigned x = 0; x < width; x++) {
-                        unsigned sx = (uint64_t)x * w / width;
+                        unsigned sx = xmap[x];
                         int yy = yp[sy * ystride + sx] - 16;
                         unsigned uv = (sy / 2) * uvstride + (sx & ~1U);
                         int uu = uvp[uv] - 128, vv = uvp[uv + 1] - 128;
@@ -1108,6 +1113,15 @@ static void em86xx_display_render(EM86XXState *s, uint32_t *dst, int stride,
         if (!view_w || !view_h) {
             continue;
         }
+        /* Copy only the sampled rows, not all of CScreen's drawing pages. */
+        int64_t first = MAX(top, 0);
+        int64_t last = MIN(top + (int64_t)(height - 1) * view_h / height,
+                           (int64_t)h - 1);
+        if (first > last) {
+            continue;
+        }
+        pixels += ((uint64_t)by + first) * pitch * bpp;
+        bytes = (last - first + 1) * pitch * bpp;
         uint8_t *data = g_malloc(bytes);
         if (address_space_read(&address_space_memory, pixels,
                                MEMTXATTRS_UNSPECIFIED, data, bytes) != MEMTX_OK) {
@@ -1125,26 +1139,38 @@ static void em86xx_display_render(EM86XXState *s, uint32_t *dst, int stride,
                 palette[i] = em86xx_shared_read(pal + i * 4);
             }
         }
+        for (unsigned x = 0; x < width; x++) {
+            int64_t sx = left + (int64_t)x * view_w / width;
+            xmap[x] = sx < 0 || sx >= w ? UINT_MAX : (bx + sx) * bpp;
+        }
         for (unsigned y = 0; y < height; y++) {
             int64_t sy = top + (int64_t)y * view_h / height;
             if (sy < 0 || sy >= h) {
                 continue;
             }
+            const uint8_t *row = data + (sy - first) * pitch * bpp;
             for (unsigned x = 0; x < width; x++) {
-                int64_t sx = left + (int64_t)x * view_w / width;
-                if (sx < 0 || sx >= w) {
+                unsigned offset = xmap[x];
+                if (offset == UINT_MAX) {
                     continue;
                 }
-                size_t pos = (((uint64_t)by + sy) * pitch + bx + sx) * bpp;
-                uint32_t p = mode == 4 ? palette[data[pos]] :
-                                        ldl_le_p(data + pos);
+                uint32_t p = mode == 4 ? palette[row[offset]] :
+                                        ldl_le_p(row + offset);
                 unsigned a = p >> 24;
+                if (!a) {
+                    continue;
+                }
                 int r = (p >> 16) & 255, g = (p >> 8) & 255, b = p & 255;
                 if (colorspace == 4 || colorspace == 5) {
                     int yy = r - 16, u = b - 128, v = g - 128;
                     r = (298 * yy + 409 * v + 128) >> 8;
                     g = (298 * yy - 100 * u - 208 * v + 128) >> 8;
                     b = (298 * yy + 516 * u + 128) >> 8;
+                }
+                if (a == 255) {
+                    dst[y * stride + x] = (CLAMP(r, 0, 255) << 16) |
+                        (CLAMP(g, 0, 255) << 8) | CLAMP(b, 0, 255);
+                    continue;
                 }
                 uint32_t old = dst[y * stride + x];
                 r = (CLAMP(r, 0, 255) * a +
