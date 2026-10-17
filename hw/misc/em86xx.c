@@ -8,6 +8,7 @@
 #include "qemu/timer.h"
 #include "qemu/log.h"
 #include "qemu/bswap.h"
+#include "qemu/units.h"
 #include "qapi/error.h"
 #include "system/reset.h"
 #include "qemu/audio.h"
@@ -983,12 +984,44 @@ static bool em86xx_display_address(hwaddr addr, uint64_t size)
 static const struct {
         hwaddr info;
         hwaddr control;
+        hwaddr window;
 } em86xx_layers[] = {
-        { 0x10002ce4, 0x10002d9c },
-        { 0x10002bf4, 0x10002c9c },
-        { 0x10002de4, 0x10002e2c },
-        { 0x10002e74, 0x10002eb4 },
+        { 0x10002ce4, 0x10002d9c, 0x10002d30 },
+        { 0x10002bf4, 0x10002c9c, 0x10002c3c },
+        { 0x10002de4, 0x10002e2c, 0x10002df0 },
+        { 0x10002e74, 0x10002eb4, 0x10002e80 },
     };
+
+/* EMhwlibDisplayWindow uses 4096 for the complete source extent. CScreen
+ * allocates several vertically stacked pages and selects one here; the
+ * picture dimensions describe storage, not the visible viewport.
+ */
+static void em86xx_window_axis(hwaddr window, unsigned axis, unsigned extent,
+                               int64_t *start, unsigned *size)
+{
+    int32_t pos = em86xx_shared_read(window + axis * 4);
+    uint32_t length = em86xx_shared_read(window + 8 + axis * 4);
+    unsigned anchor = em86xx_shared_read(window + 16 + axis * 4);
+    unsigned pos_mode = em86xx_shared_read(window + 24 + axis * 4);
+    unsigned size_mode = em86xx_shared_read(window + 32 + axis * 4);
+
+    *start = 0;
+    *size = extent;
+    if (anchor < 1 || anchor > 4 || pos_mode < 1 || pos_mode > 2 ||
+        size_mode < 1 || size_mode > 2) {
+        return;
+    }
+    int64_t offset = pos_mode == 2 ? (int64_t)pos * extent / 4096 : pos;
+    uint64_t span = size_mode == 2 ? (uint64_t)length * extent / 4096 : length;
+    *size = MIN(span, UINT32_MAX);
+    switch (anchor) {
+    case 1: *start = offset; break;
+    case 2: *start = (int64_t)extent - offset - *size; break;
+    case 3: *start = offset - *size / 2; break;
+    case 4: *start = (int64_t)extent - offset - *size / 2; break;
+    }
+}
+
 static void em86xx_display_render(EM86XXState *s, uint32_t *dst, int stride,
                                   unsigned width, unsigned height,
                                   bool graphics_only)
@@ -1055,15 +1088,29 @@ static void em86xx_display_render(EM86XXState *s, uint32_t *dst, int stride,
             continue;
         }
         unsigned bpp = mode == 4 ? 1 : 4;
+        unsigned pitch = em86xx_shared_read(pic + 4);
+        unsigned bx = em86xx_shared_read(pic + 0x10);
+        unsigned by = em86xx_shared_read(pic + 0x14);
+        if (!pitch) {
+            pitch = w;
+        }
+        uint64_t bytes = (uint64_t)pitch * ((uint64_t)by + h) * bpp;
         if (!w || !h || w > 1920 || h > 4320 ||
+            pitch > 8192 || (uint64_t)bx + w > pitch || bytes > 128 * MiB ||
             (mode != 4 && !((mode == 5 || mode == 6) && format == 4)) ||
-            !em86xx_display_address(pixels, (uint64_t)w * h * bpp)) {
+            !em86xx_display_address(pixels, bytes)) {
             continue;
         }
-        uint8_t *data = g_malloc((size_t)w * h * bpp);
+        int64_t left, top;
+        unsigned view_w, view_h;
+        em86xx_window_axis(em86xx_layers[l].window, 0, w, &left, &view_w);
+        em86xx_window_axis(em86xx_layers[l].window, 1, h, &top, &view_h);
+        if (!view_w || !view_h) {
+            continue;
+        }
+        uint8_t *data = g_malloc(bytes);
         if (address_space_read(&address_space_memory, pixels,
-                               MEMTXATTRS_UNSPECIFIED, data,
-                               (size_t)w * h * bpp) != MEMTX_OK) {
+                               MEMTXATTRS_UNSPECIFIED, data, bytes) != MEMTX_OK) {
             g_free(data);
             continue;
         }
@@ -1079,9 +1126,16 @@ static void em86xx_display_render(EM86XXState *s, uint32_t *dst, int stride,
             }
         }
         for (unsigned y = 0; y < height; y++) {
+            int64_t sy = top + (int64_t)y * view_h / height;
+            if (sy < 0 || sy >= h) {
+                continue;
+            }
             for (unsigned x = 0; x < width; x++) {
-                size_t pos = ((uint64_t)y * h / height * w +
-                              (uint64_t)x * w / width) * bpp;
+                int64_t sx = left + (int64_t)x * view_w / width;
+                if (sx < 0 || sx >= w) {
+                    continue;
+                }
+                size_t pos = (((uint64_t)by + sy) * pitch + bx + sx) * bpp;
                 uint32_t p = mode == 4 ? palette[data[pos]] :
                                         ldl_le_p(data + pos);
                 unsigned a = p >> 24;
